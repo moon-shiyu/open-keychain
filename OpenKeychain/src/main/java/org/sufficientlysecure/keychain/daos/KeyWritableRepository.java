@@ -159,19 +159,107 @@ public class KeyWritableRepository extends KeyRepository {
             LogType.MSG_IP_SUBKEY_FLAGS_XESA, LogType.MSG_IP_SUBKEY_FLAGS_CESA
     };
 
+    // ============================================================================================
+    // Signature verification helpers (shared between user IDs and user attributes)
+    // ============================================================================================
+
+    @FunctionalInterface
+    private interface SignatureVerifier {
+        boolean verify(WrappedSignature cert, UncachedPublicKey masterKey) throws PgpGeneralException;
+    }
+
+    private static class CertLogTypes {
+        final LogType badCert;
+        final LogType goodRevoke;
+        final LogType goodCert;
+        final LogType oldCert;
+        final LogType nonRevokeCert;
+        final LogType newCert;
+        final LogType certError;
+
+        CertLogTypes(LogType badCert, LogType goodRevoke, LogType goodCert,
+                LogType oldCert, LogType nonRevokeCert, LogType newCert, LogType certError) {
+            this.badCert = badCert;
+            this.goodRevoke = goodRevoke;
+            this.goodCert = goodCert;
+            this.oldCert = oldCert;
+            this.nonRevokeCert = nonRevokeCert;
+            this.newCert = newCert;
+            this.certError = certError;
+        }
+    }
+
+    private static final CertLogTypes UID_CERT_LOG_TYPES = new CertLogTypes(
+            LogType.MSG_IP_UID_CERT_BAD,
+            LogType.MSG_IP_UID_CERT_GOOD_REVOKE,
+            LogType.MSG_IP_UID_CERT_GOOD,
+            LogType.MSG_IP_UID_CERT_OLD,
+            LogType.MSG_IP_UID_CERT_NONREVOKE,
+            LogType.MSG_IP_UID_CERT_NEW,
+            LogType.MSG_IP_UID_CERT_ERROR
+    );
+
+    private static final CertLogTypes UAT_CERT_LOG_TYPES = new CertLogTypes(
+            LogType.MSG_IP_UAT_CERT_BAD,
+            LogType.MSG_IP_UAT_CERT_GOOD_REVOKE,
+            LogType.MSG_IP_UAT_CERT_GOOD,
+            LogType.MSG_IP_UAT_CERT_OLD,
+            LogType.MSG_IP_UAT_CERT_NONREVOKE,
+            LogType.MSG_IP_UAT_CERT_NEW,
+            LogType.MSG_IP_UAT_CERT_ERROR
+    );
+
     /**
-     * Saves an UncachedKeyRing of the public variant into the db.
+     * Verifies a single third-party certificate against a trusted key.
+     * Handles cert comparison (newer/older/non-revokable) and logging.
+     * Updates item.trustedCerts if this cert should replace a previous one.
+     */
+    private void verifyTrustedCert(WrappedSignature cert, CanonicalizedPublicKey trustedKey,
+            UncachedPublicKey masterKey, UserPacketItem item,
+            SignatureVerifier verifier, CertLogTypes logTypes) {
+        try {
+            cert.init(trustedKey);
+            if (!verifier.verify(cert, masterKey)) {
+                log(logTypes.badCert);
+                return;
+            }
+
+            log(cert.isRevocation() ? logTypes.goodRevoke : logTypes.goodCert,
+                    KeyFormattingUtils.convertKeyIdToHexShort(trustedKey.getKeyId()));
+
+            WrappedSignature prev = item.trustedCerts.get(cert.getKeyId());
+            if (prev != null) {
+                if (prev.getCreationTime().after(cert.getCreationTime())) {
+                    log(logTypes.oldCert);
+                    return;
+                }
+                if (!prev.isRevocation() && !prev.isRevokable()) {
+                    log(logTypes.nonRevokeCert);
+                    return;
+                }
+                log(logTypes.newCert);
+            }
+            item.trustedCerts.put(cert.getKeyId(), cert);
+
+        } catch (PgpGeneralException e) {
+            log(logTypes.certError, KeyFormattingUtils.convertKeyIdToHex(cert.getKeyId()));
+        }
+    }
+
+    // ============================================================================================
+    // saveCanonicalizedPublicKeyRing — public keyring persistence
+    // ============================================================================================
+
+    /**
+     * Saves a canonicalized public keyring into the database.
      * <p/>
-     * This method will not delete all previous data for this masterKeyId from the database prior
+     * This method will delete all previous data for this masterKeyId from the database prior
      * to inserting. All public data is effectively re-inserted, secret keyrings are left deleted
      * and need to be saved externally to be preserved past the operation.
      */
-    @SuppressWarnings("unchecked")
     private int saveCanonicalizedPublicKeyRing(CanonicalizedPublicKeyRing keyRing, boolean selfCertsAreTrusted) {
 
-        // start with ok result
         int result = SaveKeyringResult.SAVED_PUBLIC;
-
         long masterKeyId = keyRing.getMasterKeyId();
         UncachedPublicKey masterKey = keyRing.getPublicKey();
 
@@ -195,312 +283,15 @@ public class KeyWritableRepository extends KeyRepository {
             Keyrings_public keyRingPublic = new Keyrings_public(masterKeyId, encodedRingIfDbCachable);
             operations.add(DatabaseBatchInteractor.createInsertKeyRingPublic(keyRingPublic));
 
-            log(LogType.MSG_IP_INSERT_SUBKEYS);
-            mIndent += 1;
-            { // insert subkeys
-                int rank = 0;
-                for (CanonicalizedPublicKey key : keyRing.publicKeyIterator()) {
-                    long keyId = key.getKeyId();
-                    log(keyId == masterKeyId ? LogType.MSG_IP_MASTER : LogType.MSG_IP_SUBKEY,
-                            KeyFormattingUtils.convertKeyIdToHex(keyId)
-                    );
-                    mIndent += 1;
+            buildSubkeyBatchOperations(keyRing, masterKeyId, operations);
 
-                    boolean c = key.canCertify(), e = key.canEncrypt(), s = key.canSign(), a = key.canAuthenticate();
-
-                    // see above
-                    if (masterKeyId == keyId) {
-                        if (key.getKeyUsage() == null) {
-                            log(LogType.MSG_IP_MASTER_FLAGS_UNSPECIFIED);
-                        } else {
-                            log(LOG_TYPES_FLAG_MASTER[(c ? 1 : 0) + (e ? 2 : 0) + (s ? 4 : 0) + (a ? 8 : 0)]);
-                        }
-                    } else {
-                        if (key.getKeyUsage() == null) {
-                            log(LogType.MSG_IP_SUBKEY_FLAGS_UNSPECIFIED);
-                        } else {
-                            log(LOG_TYPES_FLAG_SUBKEY[(c ? 1 : 0) + (e ? 2 : 0) + (s ? 4 : 0) + (a ? 8 : 0)]);
-                        }
-                    }
-
-                    Date creation = key.getCreationTime();
-                    Date bindingSignatureTime = key.getBindingSignatureTime();
-                    Date expiry = key.getExpiryTime();
-                    if (expiry != null) {
-                        if (key.isExpired()) {
-                            log(keyId == masterKeyId ?
-                                            LogType.MSG_IP_MASTER_EXPIRED : LogType.MSG_IP_SUBKEY_EXPIRED,
-                                    expiry.toString());
-                        } else {
-                            log(keyId == masterKeyId ?
-                                            LogType.MSG_IP_MASTER_EXPIRES : LogType.MSG_IP_SUBKEY_EXPIRES,
-                                    expiry.toString());
-                        }
-                    }
-
-                    long creationUnixTime = creation.getTime() / 1000;
-                    Long expiryUnixTime = expiry != null ? expiry.getTime() / 1000 : null;
-                    long validFromTime = bindingSignatureTime.getTime() / 1000;
-                    Keys subKey = new Keys(masterKeyId, rank, key.getKeyId(),
-                            key.getBitStrength(), key.getCurveOid(), key.getAlgorithm(), key.getFingerprint(),
-                            c, s, e, a, key.isRevoked(), SecretKeyType.UNAVAILABLE, key.isSecure(), creationUnixTime, expiryUnixTime, validFromTime);
-                    operations.add(DatabaseBatchInteractor.createInsertSubKey(subKey));
-
-                    ++rank;
-                    mIndent -= 1;
-                }
-            }
-            mIndent -= 1;
-
-            // get a list of owned secret keys, for verification filtering
             LongSparseArray<CanonicalizedPublicKey> trustedKeys = getTrustedMasterKeys();
-
-            // classify and order user ids. primary are moved to the front, revoked to the back,
-            // otherwise the order in the keyfile is preserved.
             List<UserPacketItem> uids = new ArrayList<>();
 
-            List<Long> signerKeyIds = new ArrayList<>();
+            classifyAndVerifyUserIds(masterKey, masterKeyId, trustedKeys, uids, operations);
+            classifyAndVerifyUserAttributes(masterKey, masterKeyId, trustedKeys, uids);
 
-            if (trustedKeys.size() == 0) {
-                log(LogType.MSG_IP_UID_CLASSIFYING_ZERO);
-            } else {
-                log(LogType.MSG_IP_UID_CLASSIFYING, trustedKeys.size());
-            }
-            mIndent += 1;
-            for (byte[] rawUserId : masterKey.getUnorderedRawUserIds()) {
-                String userId = Utf8Util.fromUTF8ByteArrayReplaceBadEncoding(rawUserId);
-                UserPacketItem item = new UserPacketItem();
-                uids.add(item);
-                OpenPgpUtils.UserId splitUserId = KeyRing.splitUserId(userId);
-                item.userId = userId;
-                item.name = splitUserId.name;
-                item.email = splitUserId.email;
-                item.comment = splitUserId.comment;
-                int unknownCerts = 0;
-
-                log(LogType.MSG_IP_UID_PROCESSING, userId);
-                mIndent += 1;
-                // look through signatures for this specific key
-                for (WrappedSignature cert : new IterableIterator<>(
-                        masterKey.getSignaturesForRawId(rawUserId))) {
-                    long certId = cert.getKeyId();
-                    // self signature
-                    if (certId == masterKeyId) {
-
-                        // NOTE self-certificates are already verified during canonicalization,
-                        // AND we know there is at most one cert plus at most one revocation
-                        if (!cert.isRevocation()) {
-                            item.selfCert = cert;
-                            item.isPrimary = cert.isPrimaryUserId();
-                        } else {
-                            item.selfRevocation = cert;
-                            log(LogType.MSG_IP_UID_REVOKED);
-                        }
-                        continue;
-
-                    }
-
-                    // keep a note about the issuer of this key signature
-                    if (!signerKeyIds.contains(certId)) {
-                        Key_signatures keySignature = new Key_signatures(masterKeyId, certId);
-                        operations.add(DatabaseBatchInteractor.createInsertSignerKey(keySignature));
-                        signerKeyIds.add(certId);
-                    }
-
-                    boolean isSignatureFromTrustedKey = trustedKeys.indexOfKey(certId) >= 0;
-                    if (!isSignatureFromTrustedKey) {
-                        unknownCerts += 1;
-                        continue;
-                    }
-
-                    // verify signatures from known private keys
-                    CanonicalizedPublicKey trustedKey = trustedKeys.get(certId);
-
-                    try {
-                        cert.init(trustedKey);
-                        // if it doesn't certify, leave a note and skip
-                        if (!cert.verifySignature(masterKey, rawUserId)) {
-                            log(LogType.MSG_IP_UID_CERT_BAD);
-                            continue;
-                        }
-
-                        log(cert.isRevocation()
-                                        ? LogType.MSG_IP_UID_CERT_GOOD_REVOKE
-                                        : LogType.MSG_IP_UID_CERT_GOOD,
-                                KeyFormattingUtils.convertKeyIdToHexShort(trustedKey.getKeyId())
-                        );
-
-                        // check if there is a previous certificate
-                        WrappedSignature prev = item.trustedCerts.get(cert.getKeyId());
-                        if (prev != null) {
-                            // if it's newer, skip this one
-                            if (prev.getCreationTime().after(cert.getCreationTime())) {
-                                log(LogType.MSG_IP_UID_CERT_OLD);
-                                continue;
-                            }
-                            // if the previous one was a non-revokable certification, no need to look further
-                            if (!prev.isRevocation() && !prev.isRevokable()) {
-                                log(LogType.MSG_IP_UID_CERT_NONREVOKE);
-                                continue;
-                            }
-                            log(LogType.MSG_IP_UID_CERT_NEW);
-                        }
-                        item.trustedCerts.put(cert.getKeyId(), cert);
-
-                    } catch (PgpGeneralException e) {
-                        log(LogType.MSG_IP_UID_CERT_ERROR,
-                                KeyFormattingUtils.convertKeyIdToHex(cert.getKeyId()));
-                    }
-
-                }
-
-                if (unknownCerts > 0) {
-                    log(LogType.MSG_IP_UID_CERTS_UNKNOWN, unknownCerts);
-                }
-                mIndent -= 1;
-
-            }
-            mIndent -= 1;
-
-            ArrayList<WrappedUserAttribute> userAttributes = masterKey.getUnorderedUserAttributes();
-            // Don't spam the log if there aren't even any attributes
-            if (!userAttributes.isEmpty()) {
-                log(LogType.MSG_IP_UAT_CLASSIFYING);
-            }
-
-            mIndent += 1;
-            for (WrappedUserAttribute userAttribute : userAttributes) {
-
-                UserPacketItem item = new UserPacketItem();
-                uids.add(item);
-                item.type = userAttribute.getType();
-                item.attributeData = userAttribute.getEncoded();
-
-                int unknownCerts = 0;
-
-                switch (item.type) {
-                    case WrappedUserAttribute.UAT_IMAGE:
-                        log(LogType.MSG_IP_UAT_PROCESSING_IMAGE);
-                        break;
-                    default:
-                        log(LogType.MSG_IP_UAT_PROCESSING_UNKNOWN);
-                        break;
-                }
-                mIndent += 1;
-                // look through signatures for this specific key
-                for (WrappedSignature cert : new IterableIterator<>(
-                        masterKey.getSignaturesForUserAttribute(userAttribute))) {
-                    long certId = cert.getKeyId();
-                    // self signature
-                    if (certId == masterKeyId) {
-
-                        // NOTE self-certificates are already verified during canonicalization,
-                        // AND we know there is at most one cert plus at most one revocation
-                        // AND the revocation only exists if there is no newer certification
-                        if (!cert.isRevocation()) {
-                            item.selfCert = cert;
-                        } else {
-                            item.selfRevocation = cert;
-                            log(LogType.MSG_IP_UAT_REVOKED);
-                        }
-                        continue;
-
-                    }
-
-                    // do we have a trusted key for this?
-                    if (trustedKeys.indexOfKey(certId) < 0) {
-                        unknownCerts += 1;
-                        continue;
-                    }
-
-                    // verify signatures from known private keys
-                    CanonicalizedPublicKey trustedKey = trustedKeys.get(certId);
-
-                    try {
-                        cert.init(trustedKey);
-                        // if it doesn't certify, leave a note and skip
-                        if (!cert.verifySignature(masterKey, userAttribute)) {
-                            log(LogType.MSG_IP_UAT_CERT_BAD);
-                            continue;
-                        }
-
-                        log(cert.isRevocation()
-                                        ? LogType.MSG_IP_UAT_CERT_GOOD_REVOKE
-                                        : LogType.MSG_IP_UAT_CERT_GOOD,
-                                KeyFormattingUtils.convertKeyIdToHexShort(trustedKey.getKeyId())
-                        );
-
-                        // check if there is a previous certificate
-                        WrappedSignature prev = item.trustedCerts.get(cert.getKeyId());
-                        if (prev != null) {
-                            // if it's newer, skip this one
-                            if (prev.getCreationTime().after(cert.getCreationTime())) {
-                                log(LogType.MSG_IP_UAT_CERT_OLD);
-                                continue;
-                            }
-                            // if the previous one was a non-revokable certification, no need to look further
-                            if (!prev.isRevocation() && !prev.isRevokable()) {
-                                log(LogType.MSG_IP_UAT_CERT_NONREVOKE);
-                                continue;
-                            }
-                            log(LogType.MSG_IP_UAT_CERT_NEW);
-                        }
-                        item.trustedCerts.put(cert.getKeyId(), cert);
-
-                    } catch (PgpGeneralException e) {
-                        log(LogType.MSG_IP_UAT_CERT_ERROR,
-                                KeyFormattingUtils.convertKeyIdToHex(cert.getKeyId()));
-                    }
-
-                }
-
-                if (unknownCerts > 0) {
-                    log(LogType.MSG_IP_UAT_CERTS_UNKNOWN, unknownCerts);
-                }
-                mIndent -= 1;
-
-            }
-            mIndent -= 1;
-
-            log(LogType.MSG_IP_UID_REORDER);
-            // primary before regular before revoked (see UserIdItem.compareTo)
-            // this is a stable sort, so the order of keys is otherwise preserved.
-            Collections.sort(uids);
-            // iterate and put into db
-            for (int userIdRank = 0; userIdRank < uids.size(); userIdRank++) {
-                UserPacketItem item = uids.get(userIdRank);
-                Long type = item.type != null ? item.type.longValue() : null;
-                User_packets userPacket = new User_packets(masterKeyId, userIdRank, type, item.userId, item.name, item.email,
-                        item.comment, item.attributeData, item.isPrimary, item.selfRevocation != null);
-                operations.add(DatabaseBatchInteractor.createInsertUserPacket(userPacket));
-
-                if (item.selfRevocation != null) {
-                    operations.add(buildCertOperations(masterKeyId, userIdRank, item.selfRevocation,
-                            VerificationStatus.VERIFIED_SELF));
-                    // don't bother with trusted certs if the uid is revoked, anyways
-                    continue;
-                }
-
-                if (item.selfCert == null) {
-                    throw new AssertionError("User ids MUST be self-certified at this point!!");
-                }
-
-                operations.add(buildCertOperations(masterKeyId, userIdRank, item.selfCert,
-                        selfCertsAreTrusted ? VerificationStatus.VERIFIED_SECRET : VerificationStatus.VERIFIED_SELF));
-
-                // iterate over signatures
-                for (int i = 0; i < item.trustedCerts.size(); i++) {
-                    WrappedSignature sig = item.trustedCerts.valueAt(i);
-                    // if it's a revocation
-                    if (sig.isRevocation()) {
-                        // don't further process it
-                        continue;
-                    }
-                    // otherwise, build database operation
-                    operations.add(buildCertOperations(
-                            masterKeyId, userIdRank, sig, VerificationStatus.VERIFIED_SECRET));
-                }
-            }
+            buildUserPacketBatchOperations(masterKeyId, uids, selfCertsAreTrusted, operations);
 
         } catch (IOException e) {
             log(LogType.MSG_IP_ERROR_IO_EXC);
@@ -510,6 +301,274 @@ public class KeyWritableRepository extends KeyRepository {
             mIndent -= 1;
         }
 
+        return executeSavePublicTransaction(masterKeyId, operations, encodedKeyRing, result);
+    }
+
+    /**
+     * Iterates all public keys in the ring, logs key metadata (flags, expiry),
+     * and appends insert operations for each subkey to the operations list.
+     */
+    private void buildSubkeyBatchOperations(CanonicalizedPublicKeyRing keyRing,
+            long masterKeyId, ArrayList<BatchOp> operations) {
+        log(LogType.MSG_IP_INSERT_SUBKEYS);
+        mIndent += 1;
+        int rank = 0;
+        for (CanonicalizedPublicKey key : keyRing.publicKeyIterator()) {
+            long keyId = key.getKeyId();
+            log(keyId == masterKeyId ? LogType.MSG_IP_MASTER : LogType.MSG_IP_SUBKEY,
+                    KeyFormattingUtils.convertKeyIdToHex(keyId)
+            );
+            mIndent += 1;
+
+            boolean c = key.canCertify(), e = key.canEncrypt(), s = key.canSign(), a = key.canAuthenticate();
+
+            if (masterKeyId == keyId) {
+                if (key.getKeyUsage() == null) {
+                    log(LogType.MSG_IP_MASTER_FLAGS_UNSPECIFIED);
+                } else {
+                    log(LOG_TYPES_FLAG_MASTER[(c ? 1 : 0) + (e ? 2 : 0) + (s ? 4 : 0) + (a ? 8 : 0)]);
+                }
+            } else {
+                if (key.getKeyUsage() == null) {
+                    log(LogType.MSG_IP_SUBKEY_FLAGS_UNSPECIFIED);
+                } else {
+                    log(LOG_TYPES_FLAG_SUBKEY[(c ? 1 : 0) + (e ? 2 : 0) + (s ? 4 : 0) + (a ? 8 : 0)]);
+                }
+            }
+
+            Date creation = key.getCreationTime();
+            Date bindingSignatureTime = key.getBindingSignatureTime();
+            Date expiry = key.getExpiryTime();
+            if (expiry != null) {
+                if (key.isExpired()) {
+                    log(keyId == masterKeyId ?
+                                    LogType.MSG_IP_MASTER_EXPIRED : LogType.MSG_IP_SUBKEY_EXPIRED,
+                            expiry.toString());
+                } else {
+                    log(keyId == masterKeyId ?
+                                    LogType.MSG_IP_MASTER_EXPIRES : LogType.MSG_IP_SUBKEY_EXPIRES,
+                            expiry.toString());
+                }
+            }
+
+            long creationUnixTime = creation.getTime() / 1000;
+            Long expiryUnixTime = expiry != null ? expiry.getTime() / 1000 : null;
+            long validFromTime = bindingSignatureTime.getTime() / 1000;
+            Keys subKey = new Keys(masterKeyId, rank, key.getKeyId(),
+                    key.getBitStrength(), key.getCurveOid(), key.getAlgorithm(), key.getFingerprint(),
+                    c, s, e, a, key.isRevoked(), SecretKeyType.UNAVAILABLE, key.isSecure(),
+                    creationUnixTime, expiryUnixTime, validFromTime);
+            operations.add(DatabaseBatchInteractor.createInsertSubKey(subKey));
+
+            ++rank;
+            mIndent -= 1;
+        }
+        mIndent -= 1;
+    }
+
+    /**
+     * Iterates user IDs of the master key, classifies self-certificates,
+     * verifies signatures from trusted keys, and tracks signer key IDs.
+     * Appends Key_signatures batch ops for signers encountered.
+     * <p/>
+     * NOTE: This method tracks signer key IDs in the key_signatures table —
+     * this is intentional behavior NOT shared by classifyAndVerifyUserAttributes.
+     */
+    private void classifyAndVerifyUserIds(UncachedPublicKey masterKey, long masterKeyId,
+            LongSparseArray<CanonicalizedPublicKey> trustedKeys,
+            List<UserPacketItem> uids, ArrayList<BatchOp> operations) {
+
+        List<Long> signerKeyIds = new ArrayList<>();
+
+        if (trustedKeys.size() == 0) {
+            log(LogType.MSG_IP_UID_CLASSIFYING_ZERO);
+        } else {
+            log(LogType.MSG_IP_UID_CLASSIFYING, trustedKeys.size());
+        }
+        mIndent += 1;
+        for (byte[] rawUserId : masterKey.getUnorderedRawUserIds()) {
+            String userId = Utf8Util.fromUTF8ByteArrayReplaceBadEncoding(rawUserId);
+            UserPacketItem item = new UserPacketItem();
+            uids.add(item);
+            OpenPgpUtils.UserId splitUserId = KeyRing.splitUserId(userId);
+            item.userId = userId;
+            item.name = splitUserId.name;
+            item.email = splitUserId.email;
+            item.comment = splitUserId.comment;
+            int unknownCerts = 0;
+
+            log(LogType.MSG_IP_UID_PROCESSING, userId);
+            mIndent += 1;
+            for (WrappedSignature cert : new IterableIterator<>(
+                    masterKey.getSignaturesForRawId(rawUserId))) {
+                long certId = cert.getKeyId();
+                if (certId == masterKeyId) {
+                    // NOTE self-certificates are already verified during canonicalization,
+                    // AND we know there is at most one cert plus at most one revocation
+                    if (!cert.isRevocation()) {
+                        item.selfCert = cert;
+                        item.isPrimary = cert.isPrimaryUserId();
+                    } else {
+                        item.selfRevocation = cert;
+                        log(LogType.MSG_IP_UID_REVOKED);
+                    }
+                    continue;
+                }
+
+                // keep a note about the issuer of this key signature
+                if (!signerKeyIds.contains(certId)) {
+                    Key_signatures keySignature = new Key_signatures(masterKeyId, certId);
+                    operations.add(DatabaseBatchInteractor.createInsertSignerKey(keySignature));
+                    signerKeyIds.add(certId);
+                }
+
+                boolean isSignatureFromTrustedKey = trustedKeys.indexOfKey(certId) >= 0;
+                if (!isSignatureFromTrustedKey) {
+                    unknownCerts += 1;
+                    continue;
+                }
+
+                CanonicalizedPublicKey trustedKey = trustedKeys.get(certId);
+                verifyTrustedCert(cert, trustedKey, masterKey, item,
+                        (c, mk) -> c.verifySignature(mk, rawUserId),
+                        UID_CERT_LOG_TYPES);
+            }
+
+            if (unknownCerts > 0) {
+                log(LogType.MSG_IP_UID_CERTS_UNKNOWN, unknownCerts);
+            }
+            mIndent -= 1;
+        }
+        mIndent -= 1;
+    }
+
+    /**
+     * Iterates user attributes of the master key, classifies self-certificates,
+     * and verifies signatures from trusted keys.
+     * <p/>
+     * NOTE: Does NOT track signer key IDs (intentional — user attribute signers
+     * are not stored in key_signatures table).
+     */
+    private void classifyAndVerifyUserAttributes(UncachedPublicKey masterKey, long masterKeyId,
+            LongSparseArray<CanonicalizedPublicKey> trustedKeys,
+            List<UserPacketItem> uids) {
+
+        ArrayList<WrappedUserAttribute> userAttributes = masterKey.getUnorderedUserAttributes();
+        if (!userAttributes.isEmpty()) {
+            log(LogType.MSG_IP_UAT_CLASSIFYING);
+        }
+
+        mIndent += 1;
+        for (WrappedUserAttribute userAttribute : userAttributes) {
+            UserPacketItem item = new UserPacketItem();
+            uids.add(item);
+            item.type = userAttribute.getType();
+            item.attributeData = userAttribute.getEncoded();
+
+            int unknownCerts = 0;
+
+            switch (item.type) {
+                case WrappedUserAttribute.UAT_IMAGE:
+                    log(LogType.MSG_IP_UAT_PROCESSING_IMAGE);
+                    break;
+                default:
+                    log(LogType.MSG_IP_UAT_PROCESSING_UNKNOWN);
+                    break;
+            }
+            mIndent += 1;
+            for (WrappedSignature cert : new IterableIterator<>(
+                    masterKey.getSignaturesForUserAttribute(userAttribute))) {
+                long certId = cert.getKeyId();
+                if (certId == masterKeyId) {
+                    // NOTE self-certificates are already verified during canonicalization,
+                    // AND we know there is at most one cert plus at most one revocation
+                    // AND the revocation only exists if there is no newer certification
+                    if (!cert.isRevocation()) {
+                        item.selfCert = cert;
+                    } else {
+                        item.selfRevocation = cert;
+                        log(LogType.MSG_IP_UAT_REVOKED);
+                    }
+                    continue;
+                }
+
+                if (trustedKeys.indexOfKey(certId) < 0) {
+                    unknownCerts += 1;
+                    continue;
+                }
+
+                CanonicalizedPublicKey trustedKey = trustedKeys.get(certId);
+                verifyTrustedCert(cert, trustedKey, masterKey, item,
+                        (c, mk) -> c.verifySignature(mk, userAttribute),
+                        UAT_CERT_LOG_TYPES);
+            }
+
+            if (unknownCerts > 0) {
+                log(LogType.MSG_IP_UAT_CERTS_UNKNOWN, unknownCerts);
+            }
+            mIndent -= 1;
+        }
+        mIndent -= 1;
+    }
+
+    /**
+     * Sorts user packet items (primary first, revoked last, trusted first),
+     * then builds batch operations for inserting user packets and their
+     * certifications into the database.
+     */
+    private void buildUserPacketBatchOperations(long masterKeyId, List<UserPacketItem> uids,
+            boolean selfCertsAreTrusted, ArrayList<BatchOp> operations) {
+
+        log(LogType.MSG_IP_UID_REORDER);
+        // primary before regular before revoked (see UserPacketItem.compareTo)
+        // this is a stable sort, so the order of keys is otherwise preserved.
+        Collections.sort(uids);
+        for (int userIdRank = 0; userIdRank < uids.size(); userIdRank++) {
+            UserPacketItem item = uids.get(userIdRank);
+            Long type = item.type != null ? item.type.longValue() : null;
+            User_packets userPacket = new User_packets(masterKeyId, userIdRank, type,
+                    item.userId, item.name, item.email,
+                    item.comment, item.attributeData, item.isPrimary, item.selfRevocation != null);
+            operations.add(DatabaseBatchInteractor.createInsertUserPacket(userPacket));
+
+            if (item.selfRevocation != null) {
+                operations.add(buildCertOperations(masterKeyId, userIdRank, item.selfRevocation,
+                        VerificationStatus.VERIFIED_SELF));
+                // don't bother with trusted certs if the uid is revoked, anyways
+                continue;
+            }
+
+            if (item.selfCert == null) {
+                throw new AssertionError("User ids MUST be self-certified at this point!!");
+            }
+
+            operations.add(buildCertOperations(masterKeyId, userIdRank, item.selfCert,
+                    selfCertsAreTrusted ? VerificationStatus.VERIFIED_SECRET : VerificationStatus.VERIFIED_SELF));
+
+            // iterate over trusted certifications
+            for (int i = 0; i < item.trustedCerts.size(); i++) {
+                WrappedSignature sig = item.trustedCerts.valueAt(i);
+                // skip revocations
+                if (sig.isRevocation()) {
+                    continue;
+                }
+                operations.add(buildCertOperations(
+                        masterKeyId, userIdRank, sig, VerificationStatus.VERIFIED_SECRET));
+            }
+        }
+    }
+
+    /**
+     * Executes the database transaction for saving a public keyring:
+     * deletes old data (cascading), applies batch inserts, writes large keys
+     * to filesystem, and triggers content notification.
+     *
+     * @return SaveKeyringResult flags (SAVED_PUBLIC, possibly UPDATED) or RESULT_ERROR
+     */
+    private int executeSavePublicTransaction(long masterKeyId, ArrayList<BatchOp> operations,
+            byte[] encodedKeyRing, int baseResult) {
+
+        int result = baseResult;
         SupportSQLiteDatabase db = getWritableDb();
         try {
             db.beginTransaction();
@@ -542,13 +601,20 @@ public class KeyWritableRepository extends KeyRepository {
         } finally {
             db.endTransaction();
         }
-
     }
+
+    // ============================================================================================
+    // Secret keyring persistence
+    // ============================================================================================
 
     private void writeSecretKeyRing(CanonicalizedSecretKeyRing keyRing, long masterKeyId) throws IOException {
         byte[] encodedKey = keyRing.getEncoded();
         localSecretKeyStorage.writeSecretKey(masterKeyId, encodedKey);
     }
+
+    // ============================================================================================
+    // Delete
+    // ============================================================================================
 
     public boolean deleteKeyRing(long masterKeyId) {
         try {
@@ -568,7 +634,11 @@ public class KeyWritableRepository extends KeyRepository {
         return deletedRows > 0;
     }
 
-    private static class UserPacketItem implements Comparable<UserPacketItem> {
+    // ============================================================================================
+    // Inner types
+    // ============================================================================================
+
+    static class UserPacketItem implements Comparable<UserPacketItem> {
         Integer type;
         String userId;
         String name;
@@ -605,6 +675,10 @@ public class KeyWritableRepository extends KeyRepository {
             return 0;
         }
     }
+
+    // ============================================================================================
+    // saveCanonicalizedSecretKeyRing — secret keyring persistence
+    // ============================================================================================
 
     /**
      * Saves an UncachedKeyRing of the secret variant into the db.
@@ -679,6 +753,10 @@ public class KeyWritableRepository extends KeyRepository {
         }
 
     }
+
+    // ============================================================================================
+    // Public orchestrator: savePublicKeyRing
+    // ============================================================================================
 
     /**
      * Save a public keyring into the database.
@@ -829,6 +907,10 @@ public class KeyWritableRepository extends KeyRepository {
         return savePublicKeyRing(keyRing, null, forceRefresh);
     }
 
+    // ============================================================================================
+    // Public orchestrator: saveSecretKeyRing
+    // ============================================================================================
+
     public SaveKeyringResult saveSecretKeyRing(UncachedKeyRing secretRing,
                                                ArrayList<CanonicalizedKeyRing> canKeyRings,
                                                boolean skipSave) {
@@ -958,6 +1040,10 @@ public class KeyWritableRepository extends KeyRepository {
         return saveSecretKeyRing(secretRing, null, false);
     }
 
+    // ============================================================================================
+    // Trust DB update
+    // ============================================================================================
+
     @NonNull
     public UpdateTrustResult updateTrustDb(List<Long> signerMasterKeyIds, Progressable progress) {
         OperationLog log = new OperationLog();
@@ -1008,6 +1094,10 @@ public class KeyWritableRepository extends KeyRepository {
         log.add(LogType.MSG_TRUST_OK, 1);
         return new UpdateTrustResult(UpdateTrustResult.RESULT_OK, log);
     }
+
+    // ============================================================================================
+    // Batch operation helpers
+    // ============================================================================================
 
     private BatchOp buildCertOperations(long masterKeyId, int rank, WrappedSignature cert, VerificationStatus verificationStatus) {
         try {
