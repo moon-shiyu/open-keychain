@@ -65,9 +65,7 @@ public class SecurityTokenConnection {
 
     private SecureMessaging secureMessaging;
 
-    private boolean isPw1ValidatedForSignature; // Mode 81
-    private boolean isPw1ValidatedForOther; // Mode 82
-    private boolean isPw3Validated;
+    private final PinValidationState pinValidationState = new PinValidationState();
 
 
     public static SecurityTokenConnection getInstanceForTransport(
@@ -122,15 +120,11 @@ public class SecurityTokenConnection {
             CommandApdu select = commandFactory.createSelectFileOpenPgpCommand();
             ResponseApdu response = communicate(select);  // activate connection
 
-            if (!response.isSuccess()) {
-                throw new CardException("Initialization failed!", response.getSw());
-            }
+            requireSuccess(response, "Initialization failed!");
 
             refreshConnectionCapabilities();
 
-            isPw1ValidatedForSignature = false;
-            isPw1ValidatedForOther = false;
-            isPw3Validated = false;
+            pinValidationState.reset();
 
             smEstablishIfAvailable(context);
         } catch (IOException e) {
@@ -333,9 +327,7 @@ public class SecurityTokenConnection {
         // see page 18 of [0]
         CommandApdu getKdfDoCommand = commandFactory.createGetDataCommand(0x00, 0xf9);
         ResponseApdu kdfDoResponse = communicate(getKdfDoCommand);
-        if (!kdfDoResponse.isSuccess()) {
-            throw new CardException("Couldn't get KDF.DO!", kdfDoResponse.getSw());
-        }
+        requireSuccess(kdfDoResponse, "Couldn't get KDF.DO!");
         byte[] kdfDo = kdfDoResponse.getData();
 
         // empty KDF-DO means plain UTF-8 password is being used
@@ -350,7 +342,7 @@ public class SecurityTokenConnection {
     }
 
     public void verifyPinForSignature() throws IOException {
-        if (isPw1ValidatedForSignature) {
+        if (pinValidationState.isPw1ValidatedForSignature()) {
             return;
         }
         if (cachedPin == null) {
@@ -368,15 +360,13 @@ public class SecurityTokenConnection {
         Arrays.fill(transformedPin, (byte) 0);
 
         ResponseApdu response = communicate(verifyPw1ForSignatureCommand);
-        if (!response.isSuccess()) {
-            throw new CardException("Bad PIN!", response.getSw());
-        }
+        requireSuccess(response, "Bad PIN!");
 
-        isPw1ValidatedForSignature = true;
+        pinValidationState.markPw1ValidatedForSignature();
     }
 
     public void verifyPinForOther() throws IOException {
-        if (isPw1ValidatedForOther) {
+        if (pinValidationState.isPw1ValidatedForOther()) {
             return;
         }
         if (cachedPin == null) {
@@ -394,15 +384,13 @@ public class SecurityTokenConnection {
         Arrays.fill(transformedPin, (byte) 0);
 
         ResponseApdu response = communicate(verifyPw1ForOtherCommand);
-        if (!response.isSuccess()) {
-            throw new CardException("Bad PIN!", response.getSw());
-        }
+        requireSuccess(response, "Bad PIN!");
 
-        isPw1ValidatedForOther = true;
+        pinValidationState.markPw1ValidatedForOther();
     }
 
     public void verifyAdminPin(Passphrase adminPin) throws IOException {
-        if (isPw3Validated) {
+        if (pinValidationState.isPw3Validated()) {
             return;
         }
 
@@ -416,30 +404,32 @@ public class SecurityTokenConnection {
         Arrays.fill(transformedPin, (byte) 0);
 
         ResponseApdu response = communicate(verifyPw3Command);
-        if (!response.isSuccess()) {
-            throw new CardException("Bad PIN!", response.getSw());
-        }
+        requireSuccess(response, "Bad PIN!");
 
-        isPw3Validated = true;
+        pinValidationState.markPw3Validated();
     }
 
     public void invalidateSingleUsePw1() {
         if (!openPgpCapabilities.isPw1ValidForMultipleSignatures()) {
-            isPw1ValidatedForSignature = false;
+            pinValidationState.invalidatePw1ForSignature();
         }
     }
 
     public void invalidatePw3() {
-        isPw3Validated = false;
+        pinValidationState.invalidatePw3();
     }
 
     // endregion
 
+    private static void requireSuccess(ResponseApdu response, String message) throws CardException {
+        if (!response.isSuccess()) {
+            throw new CardException(message, response.getSw());
+        }
+    }
+
     private byte[] readData(int p1, int p2) throws IOException {
         ResponseApdu response = communicate(commandFactory.createGetDataCommand(p1, p2));
-        if (!response.isSuccess()) {
-            throw new CardException("Failed to get pw status bytes", response.getSw());
-        }
+        requireSuccess(response, "Failed to get pw status bytes");
         return response.getData();
     }
 
