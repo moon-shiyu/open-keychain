@@ -62,6 +62,40 @@ public class ApiPermissionHelper {
         }
     }
 
+    /**
+     * Typed outcome of a caller-permission check.
+     *
+     * <p>Either the caller is {@link #isAllowed() allowed}, or it is not and a {@link #getHandlingIntent()
+     * handling Intent} (a registration/error {@link PendingIntent} wrapper, or an inline error) must be
+     * returned to the client so it can resolve the situation. This carries exactly what the previous
+     * {@code Intent}-or-{@code null} return of {@link #isAllowedOrReturnIntent(Intent)} encoded.
+     */
+    public static class PermissionCheckResult {
+        private final boolean allowed;
+        private final Intent handlingIntent;
+
+        private PermissionCheckResult(boolean allowed, Intent handlingIntent) {
+            this.allowed = allowed;
+            this.handlingIntent = handlingIntent;
+        }
+
+        static PermissionCheckResult allowed() {
+            return new PermissionCheckResult(true, null);
+        }
+
+        static PermissionCheckResult requiresHandling(Intent handlingIntent) {
+            return new PermissionCheckResult(false, handlingIntent);
+        }
+
+        public boolean isAllowed() {
+            return allowed;
+        }
+
+        public Intent getHandlingIntent() {
+            return handlingIntent;
+        }
+    }
+
     /** Returns true iff the caller is allowed, or false on any type of problem.
      * This method should only be used in cases where error handling is dealt with separately.
      */
@@ -79,10 +113,25 @@ public class ApiPermissionHelper {
      * @return null if caller is allowed, or a Bundle with a PendingIntent
      */
     protected Intent isAllowedOrReturnIntent(Intent data) {
+        PermissionCheckResult result = checkSubjectPermission(data);
+        return result.isAllowed() ? null : result.getHandlingIntent();
+    }
+
+    /**
+     * Checks if the calling app is allowed to access the API, returning a typed {@link PermissionCheckResult}.
+     *
+     * <p>The branching here is identical to the previous inline logic of {@link #isAllowedOrReturnIntent(Intent)}:
+     * an allowed caller yields {@link PermissionCheckResult#allowed()}; an unregistered caller yields a
+     * registration {@link PendingIntent} wrapped in a {@code RESULT_CODE_USER_INTERACTION_REQUIRED} Intent; a
+     * {@link NameNotFoundException} yields an inline {@code RESULT_CODE_ERROR} Intent; and a signature mismatch
+     * ({@link WrongPackageCertificateException}) yields an error {@link PendingIntent} wrapper. The emitted
+     * {@code OpenPgpApi.*} extras are kept verbatim — the SSH service relies on these exact wire keys too.
+     */
+    PermissionCheckResult checkSubjectPermission(Intent data) {
         ApiPendingIntentFactory piFactory = new ApiPendingIntentFactory(mContext);
         try {
             if (isCallerAllowed()) {
-                return null;
+                return PermissionCheckResult.allowed();
             } else {
                 String packageName = getCurrentCallingPackage();
                 Timber.d("isAllowed packageName: " + packageName);
@@ -97,7 +146,7 @@ public class ApiPermissionHelper {
                     result.putExtra(OpenPgpApi.RESULT_CODE, OpenPgpApi.RESULT_CODE_ERROR);
                     result.putExtra(OpenPgpApi.RESULT_ERROR,
                             new OpenPgpError(OpenPgpError.GENERIC_ERROR, e.getMessage()));
-                    return result;
+                    return PermissionCheckResult.requiresHandling(result);
                 }
                 Timber.e("Not allowed to use service! return PendingIntent for registration!");
 
@@ -108,7 +157,7 @@ public class ApiPermissionHelper {
                 result.putExtra(OpenPgpApi.RESULT_CODE, OpenPgpApi.RESULT_CODE_USER_INTERACTION_REQUIRED);
                 result.putExtra(OpenPgpApi.RESULT_INTENT, pi);
 
-                return result;
+                return PermissionCheckResult.requiresHandling(result);
             }
         } catch (WrongPackageCertificateException e) {
             Timber.e(e, "wrong signature!");
@@ -120,7 +169,7 @@ public class ApiPermissionHelper {
             result.putExtra(OpenPgpApi.RESULT_CODE, OpenPgpApi.RESULT_CODE_USER_INTERACTION_REQUIRED);
             result.putExtra(OpenPgpApi.RESULT_INTENT, pi);
 
-            return result;
+            return PermissionCheckResult.requiresHandling(result);
         }
     }
 

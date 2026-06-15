@@ -21,7 +21,6 @@ package org.sufficientlysecure.keychain.remote;
 import java.security.NoSuchAlgorithmException;
 import java.security.PublicKey;
 import java.util.Collections;
-import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 
@@ -165,11 +164,7 @@ public class SshAuthenticationService extends Service {
 
         authData.setHashAlgorithm(hashAlgorithmTag);
 
-        CryptoInputParcel inputParcel = CryptoInputParcelCacheService.getCryptoInputParcel(this, data);
-        if (inputParcel == null) {
-            // fresh request, assign UUID
-            inputParcel = CryptoInputParcel.createCryptoInputParcel(new Date());
-        }
+        CryptoInputParcel inputParcel = RemoteCryptoInputHelper.getOrCreate(this, data, true);
 
         AuthenticationParcel authParcel = AuthenticationParcel
                 .createAuthenticationParcel(authData.build(), challenge);
@@ -284,11 +279,7 @@ public class SshAuthenticationService extends Service {
     }
 
     private Intent packagePendingIntent(PendingIntent pi) {
-        Intent result = new Intent();
-        result.putExtra(SshAuthenticationApi.EXTRA_RESULT_CODE,
-                SshAuthenticationApi.RESULT_CODE_USER_INTERACTION_REQUIRED);
-        result.putExtra(SshAuthenticationApi.EXTRA_PENDING_INTENT, pi);
-        return result;
+        return SshApiResult.userInteractionRequired(pi);
     }
 
     private Intent getAuthenticationPublicKey(Intent data, boolean asSshKey) {
@@ -406,9 +397,9 @@ public class SshAuthenticationService extends Service {
         }
 
         // check if caller is allowed to access OpenKeychain
-        Intent result = mApiPermissionHelper.isAllowedOrReturnIntent(data);
-        if (result != null) {
-            return result; // disallowed, redirect to registration
+        ApiPermissionHelper.PermissionCheckResult permissionResult = mApiPermissionHelper.checkSubjectPermission(data);
+        if (!permissionResult.isAllowed()) {
+            return permissionResult.getHandlingIntent(); // disallowed, redirect to registration
         }
 
         return null;
@@ -416,10 +407,7 @@ public class SshAuthenticationService extends Service {
 
     private Intent createErrorResult(int errorCode, String errorMessage) {
         Timber.e(errorMessage);
-        Intent result = new Intent();
-        result.putExtra(SshAuthenticationApi.EXTRA_ERROR, new SshAuthenticationApiError(errorCode, errorMessage));
-        result.putExtra(SshAuthenticationApi.EXTRA_RESULT_CODE, SshAuthenticationApi.RESULT_CODE_ERROR);
-        return result;
+        return SshApiResult.error(errorCode, errorMessage);
     }
 
     private Intent createExceptionErrorResult(int errorCode, String errorMessage, Exception e) {
