@@ -1,3 +1,20 @@
+/*
+ * Copyright (C) 2017 Schurmann & Breitmoser GbR
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 package org.sufficientlysecure.keychain.operations;
 
 
@@ -9,6 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import android.content.Context;
 import androidx.annotation.NonNull;
+import androidx.annotation.VisibleForTesting;
 
 import org.sufficientlysecure.keychain.Constants;
 import org.sufficientlysecure.keychain.daos.KeyMetadataDao;
@@ -25,7 +43,7 @@ import timber.log.Timber;
 
 
 public class KeySyncOperation extends BaseReadWriteOperation<KeySyncParcel> {
-    // time since last update after which a key should be updated again, in s
+    // time since last update after which a key should be updated again, in ms
     private static final long KEY_STALE_THRESHOLD_MILLIS =
             Constants.DEBUG_KEYSERVER_SYNC ? 1 : TimeUnit.DAYS.toMillis(7);
     // Time taken by Orbot before a new circuit is created
@@ -37,38 +55,85 @@ public class KeySyncOperation extends BaseReadWriteOperation<KeySyncParcel> {
 
     public KeySyncOperation(Context context, KeyWritableRepository databaseInteractor,
             Progressable progressable, AtomicBoolean cancellationSignal) {
+        this(context, databaseInteractor, progressable, cancellationSignal,
+                KeyMetadataDao.create(context), Preferences.getPreferences(context));
+    }
+
+    @VisibleForTesting
+    KeySyncOperation(Context context, KeyWritableRepository databaseInteractor,
+            Progressable progressable, AtomicBoolean cancellationSignal,
+            KeyMetadataDao keyMetadataDao, Preferences preferences) {
         super(context, databaseInteractor, progressable, cancellationSignal);
 
-        keyMetadataDao = KeyMetadataDao.create(context);
-        preferences = Preferences.getPreferences(context);
+        this.keyMetadataDao = keyMetadataDao;
+        this.preferences = preferences;
     }
 
     @NonNull
     @Override
-    public ImportKeyResult execute(KeySyncParcel input, CryptoInputParcel cryptoInput) {
-        long staleKeyThreshold = System.currentTimeMillis() - (input.getRefreshAll() ? 0 : KEY_STALE_THRESHOLD_MILLIS);
+    public ImportKeyResult execute(KeySyncParcel input, CryptoInputParcel cryptoInputParcel) {
+        long staleKeyThreshold = resolveStaleThreshold(input.getRefreshAll());
         List<byte[]> staleKeyFingerprints =
                 keyMetadataDao.getFingerprintsForKeysOlderThan(staleKeyThreshold, TimeUnit.MILLISECONDS);
-        List<ParcelableKeyRing> staleKeyParcelableKeyRings = fingerprintListToParcelableKeyRings(staleKeyFingerprints);
 
-        if (checkCancelled()) { // if we've already been cancelled
+        Timber.d("Keyserver sync: found %d stale keys", staleKeyFingerprints.size());
+
+        List<ParcelableKeyRing> staleKeyParcelableKeyRings =
+                fingerprintListToParcelableKeyRings(staleKeyFingerprints);
+
+        if (checkCancelled()) {
             return new ImportKeyResult(OperationResult.RESULT_CANCELLED, new OperationResult.OperationLog());
         }
 
-        // no explicit proxy, retrieve from preferences. Check if we should do a staggered sync
-        CryptoInputParcel cryptoInputParcel = CryptoInputParcel.createCryptoInputParcel();
+        if (staleKeyParcelableKeyRings.isEmpty()) {
+            Timber.d("Keyserver sync: no stale keys to refresh");
+            return new ImportKeyResult(OperationResult.RESULT_OK, new OperationResult.OperationLog());
+        }
+
         boolean reinsertAll = input.getRefreshAll();
 
-        ImportKeyResult importKeyResult;
-        if (!reinsertAll && preferences.getParcelableProxy().isTorEnabled()) {
-            importKeyResult = staggeredUpdate(staleKeyParcelableKeyRings, cryptoInputParcel);
+        if (shouldUseStaggeredUpdate(reinsertAll)) {
+            return staggeredUpdate(staleKeyParcelableKeyRings, cryptoInputParcel);
         } else {
-            importKeyResult = directUpdate(staleKeyParcelableKeyRings, cryptoInputParcel, reinsertAll);
+            return directUpdate(staleKeyParcelableKeyRings, cryptoInputParcel, reinsertAll);
         }
-        return importKeyResult;
     }
 
-    private List<ParcelableKeyRing> fingerprintListToParcelableKeyRings(List<byte[]> staleKeyFingerprints) {
+    /**
+     * Compute the stale-key timestamp threshold.
+     *
+     * @param refreshAll if true, all keys are considered stale (threshold = now)
+     * @return epoch millis; keys last updated before this time are considered stale
+     */
+    @VisibleForTesting
+    static long resolveStaleThreshold(boolean refreshAll) {
+        long staleKeyThresholdMs = refreshAll ? 0 : KEY_STALE_THRESHOLD_MILLIS;
+        return System.currentTimeMillis() - staleKeyThresholdMs;
+    }
+
+    /**
+     * Decide whether to use staggered (parcimonie-style) update for Tor privacy.
+     * Staggered updates are only used for periodic refresh (not refreshAll) when Tor is enabled.
+     */
+    @VisibleForTesting
+    boolean shouldUseStaggeredUpdate(boolean refreshAll) {
+        return !refreshAll && preferences.getParcelableProxy().isTorEnabled();
+    }
+
+    /**
+     * Build an ImportKeyringParcel for the given key list using the preferred keyserver.
+     */
+    private ImportKeyringParcel buildImportInput(List<ParcelableKeyRing> keyList, boolean forceReinsert) {
+        return ImportKeyringParcel.createImportKeyringParcel(
+                keyList, preferences.getPreferredKeyserver(), forceReinsert);
+    }
+
+    /**
+     * Convert a list of raw fingerprints to ParcelableKeyRing objects suitable for import.
+     * Each ParcelableKeyRing is created with only the fingerprint set (no keyserver or bytes).
+     */
+    @VisibleForTesting
+    static List<ParcelableKeyRing> fingerprintListToParcelableKeyRings(List<byte[]> staleKeyFingerprints) {
         ArrayList<ParcelableKeyRing> result = new ArrayList<>(staleKeyFingerprints.size());
         for (byte[] fingerprint : staleKeyFingerprints) {
             Timber.d("Keyserver sync: Updating %s", KeyFormattingUtils.beautifyKeyId(fingerprint));
@@ -82,7 +147,7 @@ public class KeySyncOperation extends BaseReadWriteOperation<KeySyncParcel> {
         Timber.d("Starting normal update");
         ImportOperation importOp = new ImportOperation(mContext, mKeyWritableRepository, mProgressable, mCancelled);
         return importOp.execute(
-                ImportKeyringParcel.createImportKeyringParcel(keyList, preferences.getPreferredKeyserver(), reinsertAll),
+                buildImportInput(keyList, reinsertAll),
                 cryptoInputParcel
         );
     }
@@ -126,7 +191,7 @@ public class KeySyncOperation extends BaseReadWriteOperation<KeySyncParcel> {
 
             Timber.d("Updating key with a wait time of %d seconds", waitTime);
             try {
-                Thread.sleep(waitTime * 1000);
+                Thread.sleep(waitTime * 1000L);
             } catch (InterruptedException e) {
                 Timber.e(e, "Exception during sleep between key updates");
                 // skip this one
@@ -141,10 +206,7 @@ public class KeySyncOperation extends BaseReadWriteOperation<KeySyncParcel> {
             ImportKeyResult result =
                     new ImportOperation(mContext, mKeyWritableRepository, null, mCancelled)
                             .execute(
-                                    ImportKeyringParcel.createImportKeyringParcel(
-                                            keyWrapper,
-                                            preferences.getPreferredKeyserver()
-                                    ),
+                                    buildImportInput(keyWrapper, false),
                                     cryptoInputParcel
                             );
             if (result.isPending()) {
