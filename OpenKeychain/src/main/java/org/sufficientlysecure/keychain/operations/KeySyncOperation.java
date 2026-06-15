@@ -34,13 +34,32 @@ public class KeySyncOperation extends BaseReadWriteOperation<KeySyncParcel> {
 
     private final KeyMetadataDao keyMetadataDao;
     private final Preferences preferences;
+    private final ImportOperationFactory importOperationFactory;
 
     public KeySyncOperation(Context context, KeyWritableRepository databaseInteractor,
             Progressable progressable, AtomicBoolean cancellationSignal) {
+        this(context, databaseInteractor, progressable, cancellationSignal, ImportOperation::new);
+    }
+
+    KeySyncOperation(Context context, KeyWritableRepository databaseInteractor,
+            Progressable progressable, AtomicBoolean cancellationSignal,
+            ImportOperationFactory importOperationFactory) {
         super(context, databaseInteractor, progressable, cancellationSignal);
 
         keyMetadataDao = KeyMetadataDao.create(context);
         preferences = Preferences.getPreferences(context);
+        this.importOperationFactory = importOperationFactory;
+    }
+
+    /**
+     * Seam for constructing the {@link ImportOperation} that performs the actual keyserver
+     * refresh. Defaults to {@link ImportOperation#ImportOperation(Context, KeyWritableRepository,
+     * Progressable, AtomicBoolean)}; tests inject a fake to avoid network access.
+     */
+    @FunctionalInterface
+    interface ImportOperationFactory {
+        ImportOperation create(Context context, KeyWritableRepository databaseInteractor,
+                Progressable progressable, AtomicBoolean cancellationSignal);
     }
 
     @NonNull
@@ -80,7 +99,7 @@ public class KeySyncOperation extends BaseReadWriteOperation<KeySyncParcel> {
     private ImportKeyResult directUpdate(List<ParcelableKeyRing> keyList, CryptoInputParcel cryptoInputParcel,
             boolean reinsertAll) {
         Timber.d("Starting normal update");
-        ImportOperation importOp = new ImportOperation(mContext, mKeyWritableRepository, mProgressable, mCancelled);
+        ImportOperation importOp = importOperationFactory.create(mContext, mKeyWritableRepository, mProgressable, mCancelled);
         return importOp.execute(
                 ImportKeyringParcel.createImportKeyringParcel(keyList, preferences.getPreferredKeyserver(), reinsertAll),
                 cryptoInputParcel
@@ -139,7 +158,7 @@ public class KeySyncOperation extends BaseReadWriteOperation<KeySyncParcel> {
                 new OperationResult.OperationLog());
             }
             ImportKeyResult result =
-                    new ImportOperation(mContext, mKeyWritableRepository, null, mCancelled)
+                    importOperationFactory.create(mContext, mKeyWritableRepository, null, mCancelled)
                             .execute(
                                     ImportKeyringParcel.createImportKeyringParcel(
                                             keyWrapper,
