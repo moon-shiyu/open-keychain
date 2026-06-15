@@ -612,6 +612,59 @@ public class KeyWritableRepository extends KeyRepository {
         localSecretKeyStorage.writeSecretKey(masterKeyId, encodedKey);
     }
 
+    /**
+     * Canonicalizes a secret ring, with fallback to merging self-certificates from the
+     * corresponding public keyring (Symantec PGP Desktop compatibility).
+     * <p>
+     * Symantec PGP Desktop may export secret keys without self-certificates. We don't support
+     * those on their own, but if the corresponding public key is known, the self-cert info can
+     * be merged in as a special case.
+     *
+     * @return the canonicalized secret ring, or null if canonicalization fails even after fallback
+     */
+    private CanonicalizedSecretKeyRing canonicalizeSecretRingWithFallback(
+            UncachedKeyRing secretRing, long masterKeyId) throws IOException {
+        CanonicalizedSecretKeyRing result =
+                (CanonicalizedSecretKeyRing) secretRing.canonicalize(mLog, mIndent);
+        if (result != null) {
+            return result;
+        }
+        // Fallback: merge self-certificates from existing public keyring and retry
+        try {
+            log(LogType.MSG_IS_MERGE_SPECIAL);
+            UncachedKeyRing oldPublicRing =
+                    getCanonicalizedPublicKeyRing(masterKeyId).getUncachedKeyRing();
+            secretRing = secretRing.merge(oldPublicRing, mLog, mIndent);
+            return (CanonicalizedSecretKeyRing) secretRing.canonicalize(mLog, mIndent);
+        } catch (NotFoundException e2) {
+            return null;
+        }
+    }
+
+    /**
+     * Merges secret ring data into the existing public ring, or extracts a public ring
+     * from the secret ring if no public ring exists yet.
+     *
+     * @return the canonicalized public ring, or null on merge/canonicalize failure
+     */
+    private CanonicalizedPublicKeyRing extractOrMergePublicRing(
+            UncachedKeyRing secretRing, long masterKeyId) throws IOException {
+        UncachedKeyRing publicRing;
+        try {
+            UncachedKeyRing oldPublicRing =
+                    getCanonicalizedPublicKeyRing(masterKeyId).getUncachedKeyRing();
+            log(LogType.MSG_IS_MERGE_PUBLIC);
+            publicRing = oldPublicRing.merge(secretRing, mLog, mIndent);
+            if (publicRing == null) {
+                return null;
+            }
+        } catch (NotFoundException e) {
+            log(LogType.MSG_IS_PUBRING_GENERATE);
+            publicRing = secretRing.extractPublicKeyRing();
+        }
+        return (CanonicalizedPublicKeyRing) publicRing.canonicalize(mLog, mIndent);
+    }
+
     // ============================================================================================
     // Delete
     // ============================================================================================
@@ -704,44 +757,42 @@ public class KeyWritableRepository extends KeyRepository {
                 return SaveKeyringResult.RESULT_ERROR;
             }
 
-            {
-                KeysQueries keysQueries = getDatabase().getKeysQueries();
-                UtilQueries utilQueries = getDatabase().getUtilQueries();
+            KeysQueries keysQueries = getDatabase().getKeysQueries();
+            UtilQueries utilQueries = getDatabase().getUtilQueries();
 
-                keysQueries.updateHasSecretByMasterKeyId(masterKeyId, SecretKeyType.GNU_DUMMY);
+            keysQueries.updateHasSecretByMasterKeyId(masterKeyId, SecretKeyType.GNU_DUMMY);
 
-                // then, mark exactly the keys we have available
-                log(LogType.MSG_IS_IMPORTING_SUBKEYS);
-                mIndent += 1;
-                for (CanonicalizedSecretKey sub : keyRing.secretKeyIterator()) {
-                    long id = sub.getKeyId();
-                    SecretKeyType mode = sub.getSecretKeyTypeSuperExpensive();
-                    keysQueries.updateHasSecretByKeyId(id, mode);
-                    int upd = utilQueries.selectChanges().executeAsOne().intValue();
-                    if (upd == 1) {
-                        switch (mode) {
-                            case PASSPHRASE:
-                                log(LogType.MSG_IS_SUBKEY_OK, KeyFormattingUtils.convertKeyIdToHex(id));
-                                break;
-                            case PASSPHRASE_EMPTY:
-                                log(LogType.MSG_IS_SUBKEY_EMPTY, KeyFormattingUtils.convertKeyIdToHex(id));
-                                break;
-                            case GNU_DUMMY:
-                                log(LogType.MSG_IS_SUBKEY_STRIPPED, KeyFormattingUtils.convertKeyIdToHex(id));
-                                break;
-                            case DIVERT_TO_CARD:
-                                log(LogType.MSG_IS_SUBKEY_DIVERT, KeyFormattingUtils.convertKeyIdToHex(id));
-                                break;
-                        }
-                    } else {
-                        log(LogType.MSG_IS_SUBKEY_NONEXISTENT, KeyFormattingUtils.convertKeyIdToHex(id));
+            // then, mark exactly the keys we have available
+            log(LogType.MSG_IS_IMPORTING_SUBKEYS);
+            mIndent += 1;
+            for (CanonicalizedSecretKey sub : keyRing.secretKeyIterator()) {
+                long id = sub.getKeyId();
+                SecretKeyType mode = sub.getSecretKeyTypeSuperExpensive();
+                keysQueries.updateHasSecretByKeyId(id, mode);
+                int upd = utilQueries.selectChanges().executeAsOne().intValue();
+                if (upd == 1) {
+                    switch (mode) {
+                        case PASSPHRASE:
+                            log(LogType.MSG_IS_SUBKEY_OK, KeyFormattingUtils.convertKeyIdToHex(id));
+                            break;
+                        case PASSPHRASE_EMPTY:
+                            log(LogType.MSG_IS_SUBKEY_EMPTY, KeyFormattingUtils.convertKeyIdToHex(id));
+                            break;
+                        case GNU_DUMMY:
+                            log(LogType.MSG_IS_SUBKEY_STRIPPED, KeyFormattingUtils.convertKeyIdToHex(id));
+                            break;
+                        case DIVERT_TO_CARD:
+                            log(LogType.MSG_IS_SUBKEY_DIVERT, KeyFormattingUtils.convertKeyIdToHex(id));
+                            break;
                     }
+                } else {
+                    log(LogType.MSG_IS_SUBKEY_NONEXISTENT, KeyFormattingUtils.convertKeyIdToHex(id));
                 }
-                mIndent -= 1;
-
-                // this implicitly leaves all keys which were not in the secret key ring
-                // with has_secret = 1
             }
+            mIndent -= 1;
+
+            // this implicitly leaves all keys which were not in the secret key ring
+            // with has_secret = 1
 
             databaseNotifyManager.notifyKeyChange(masterKeyId);
 
@@ -847,35 +898,19 @@ public class KeyWritableRepository extends KeyRepository {
             }
 
 
-            // If we have an expected fingerprint, make sure it matches
-            if (expectedFingerprint != null) {
-                if (!canPublicRing.containsBoundSubkey(expectedFingerprint)) {
-                    log(LogType.MSG_IP_FINGERPRINT_ERROR);
-                    return new SaveKeyringResult(SaveKeyringResult.RESULT_ERROR, mLog, null);
-                } else {
-                    log(LogType.MSG_IP_FINGERPRINT_OK);
-                }
+            if (!validateExpectedFingerprint(canPublicRing, expectedFingerprint)) {
+                return new SaveKeyringResult(SaveKeyringResult.RESULT_ERROR, mLog, null);
             }
 
-            int result;
-            if (skipSave) {
-                // skip save method, set fixed result
-                result = SaveKeyringResult.SAVED_PUBLIC
-                        | (alreadyExists ? SaveKeyringResult.UPDATED : 0);
-            } else {
-                result = saveCanonicalizedPublicKeyRing(canPublicRing, canSecretRing != null);
-            }
+            int result = skipSave
+                    ? SaveKeyringResult.SAVED_PUBLIC | (alreadyExists ? SaveKeyringResult.UPDATED : 0)
+                    : saveCanonicalizedPublicKeyRing(canPublicRing, canSecretRing != null);
 
-            // Save the saved keyring (if any)
+            // Save the secret keyring if one exists
             if (canSecretRing != null) {
-                int secretResult;
-                if (skipSave) {
-                    // skip save method, set fixed result
-                    secretResult = SaveKeyringResult.SAVED_SECRET;
-                } else {
-                    secretResult = saveCanonicalizedSecretKeyRing(canSecretRing);
-                }
-
+                int secretResult = skipSave
+                        ? SaveKeyringResult.SAVED_SECRET
+                        : saveCanonicalizedSecretKeyRing(canSecretRing);
                 if ((secretResult & SaveKeyringResult.RESULT_ERROR) != SaveKeyringResult.RESULT_ERROR) {
                     result |= SaveKeyringResult.SAVED_SECRET;
                 }
@@ -960,72 +995,31 @@ public class KeyWritableRepository extends KeyRepository {
             } catch (NotFoundException e) {
                 // Not an issue, just means we are dealing with a new keyring
 
-                // Canonicalize this keyring, to assert a number of assumptions made about it.
-                // This is a safe cast, because we made sure this is a secret ring above
-                canSecretRing = (CanonicalizedSecretKeyRing) secretRing.canonicalize(mLog, mIndent);
+                // Canonicalize, with fallback to merging self-certs from the public key (Symantec)
+                canSecretRing = canonicalizeSecretRingWithFallback(secretRing, masterKeyId);
                 if (canSecretRing == null) {
-
-                    // Special case: If keyring canonicalization failed, try again after adding
-                    // all self-certificates from the public key.
-                    try {
-                        log(LogType.MSG_IS_MERGE_SPECIAL);
-                        UncachedKeyRing oldPublicRing = getCanonicalizedPublicKeyRing(masterKeyId).getUncachedKeyRing();
-                        secretRing = secretRing.merge(oldPublicRing, mLog, mIndent);
-                        canSecretRing = (CanonicalizedSecretKeyRing) secretRing.canonicalize(mLog, mIndent);
-                    } catch (NotFoundException e2) {
-                        // nothing, this is handled right in the next line
-                    }
-
-                    if (canSecretRing == null) {
-                        return new SaveKeyringResult(SaveKeyringResult.RESULT_ERROR, mLog, null);
-                    }
+                    return new SaveKeyringResult(SaveKeyringResult.RESULT_ERROR, mLog, null);
                 }
                 if (canKeyRings != null) canKeyRings.add(canSecretRing);
             }
 
-            // Merge new data into public keyring as well, if there is any
-            UncachedKeyRing publicRing;
-            try {
-                UncachedKeyRing oldPublicRing = getCanonicalizedPublicKeyRing(masterKeyId).getUncachedKeyRing();
-
-                // Merge data from new secret ring into public one
-                log(LogType.MSG_IS_MERGE_PUBLIC);
-                publicRing = oldPublicRing.merge(secretRing, mLog, mIndent);
-                if (publicRing == null) {
-                    return new SaveKeyringResult(SaveKeyringResult.RESULT_ERROR, mLog, null);
-                }
-
-            } catch (NotFoundException e) {
-                log(LogType.MSG_IS_PUBRING_GENERATE);
-                publicRing = secretRing.extractPublicKeyRing();
-            }
-
-            CanonicalizedPublicKeyRing canPublicRing = (CanonicalizedPublicKeyRing) publicRing.canonicalize(mLog,
-                    mIndent);
+            CanonicalizedPublicKeyRing canPublicRing =
+                    extractOrMergePublicRing(secretRing, masterKeyId);
             if (canPublicRing == null) {
                 return new SaveKeyringResult(SaveKeyringResult.RESULT_ERROR, mLog, null);
             }
 
-            int publicResult;
-            if (skipSave) {
-                // skip save method, set fixed result
-                publicResult = SaveKeyringResult.SAVED_PUBLIC;
-            } else {
-                publicResult = saveCanonicalizedPublicKeyRing(canPublicRing, true);
-            }
+            int publicResult = skipSave
+                    ? SaveKeyringResult.SAVED_PUBLIC
+                    : saveCanonicalizedPublicKeyRing(canPublicRing, true);
 
             if ((publicResult & SaveKeyringResult.RESULT_ERROR) == SaveKeyringResult.RESULT_ERROR) {
                 return new SaveKeyringResult(SaveKeyringResult.RESULT_ERROR, mLog, null);
             }
 
-            int result;
-            if (skipSave) {
-                // skip save method, set fixed result
-                result = SaveKeyringResult.SAVED_SECRET
-                        | (alreadyExists ? SaveKeyringResult.UPDATED : 0);
-            } else {
-                result = saveCanonicalizedSecretKeyRing(canSecretRing);
-            }
+            int result = skipSave
+                    ? SaveKeyringResult.SAVED_SECRET | (alreadyExists ? SaveKeyringResult.UPDATED : 0)
+                    : saveCanonicalizedSecretKeyRing(canSecretRing);
 
             return new SaveKeyringResult(result, mLog, canSecretRing);
         } catch (IOException e) {
@@ -1093,6 +1087,27 @@ public class KeyWritableRepository extends KeyRepository {
 
         log.add(LogType.MSG_TRUST_OK, 1);
         return new UpdateTrustResult(UpdateTrustResult.RESULT_OK, log);
+    }
+
+    // ============================================================================================
+    // Validation helpers
+    // ============================================================================================
+
+    /**
+     * Validates the canonicalized ring against an expected fingerprint.
+     * Returns true if no fingerprint was specified or if a bound subkey matches.
+     */
+    private boolean validateExpectedFingerprint(
+            CanonicalizedPublicKeyRing canPublicRing, byte[] expectedFingerprint) {
+        if (expectedFingerprint == null) {
+            return true;
+        }
+        if (!canPublicRing.containsBoundSubkey(expectedFingerprint)) {
+            log(LogType.MSG_IP_FINGERPRINT_ERROR);
+            return false;
+        }
+        log(LogType.MSG_IP_FINGERPRINT_OK);
+        return true;
     }
 
     // ============================================================================================
