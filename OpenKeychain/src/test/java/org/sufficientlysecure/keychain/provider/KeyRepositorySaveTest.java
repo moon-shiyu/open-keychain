@@ -28,6 +28,7 @@ import org.junit.runner.RunWith;
 import org.robolectric.RuntimeEnvironment;
 import org.robolectric.shadows.ShadowLog;
 import org.sufficientlysecure.keychain.KeychainTestRunner;
+import org.sufficientlysecure.keychain.daos.KeyRepository;
 import org.sufficientlysecure.keychain.daos.KeyWritableRepository;
 import org.sufficientlysecure.keychain.model.UnifiedKeyInfo;
 import org.sufficientlysecure.keychain.operations.results.OperationResult.OperationLog;
@@ -252,6 +253,80 @@ public class KeyRepositorySaveTest {
                     signId, mDatabaseInteractor.getSecretSignId(masterKeyId));
         }
 
+    }
+
+    @Test
+    public void testSaveIdenticalPublicKeyRingBreaksOutAsUpdated() throws Exception {
+        UncachedKeyRing pub = readRingFromResource("/test-keys/mailvelope_07_no_key_flags.asc");
+
+        SaveKeyringResult firstResult = mDatabaseInteractor.savePublicKeyRing(pub);
+        Assert.assertTrue("first import should succeed", firstResult.success());
+
+        // importing the very same keyring again hits the "nothing changed" early breakout
+        SaveKeyringResult secondResult = mDatabaseInteractor.savePublicKeyRing(pub);
+        Assert.assertTrue("second identical import should succeed", secondResult.success());
+        Assert.assertTrue("second identical import should be flagged as updated", secondResult.updated());
+    }
+
+    @Test
+    public void testSavePublicKeyRingRejectsSecretRing() throws Exception {
+        UncachedKeyRing secret = readRingFromResource("/test-keys/divert_to_card_sec.asc");
+
+        SaveKeyringResult result = mDatabaseInteractor.savePublicKeyRing(secret);
+        Assert.assertFalse("saving a secret ring through the public path should fail", result.success());
+    }
+
+    @Test
+    public void testSaveSecretKeyRingRejectsPublicRing() throws Exception {
+        UncachedKeyRing pub = readRingFromResource("/test-keys/mailvelope_07_no_key_flags.asc");
+
+        SaveKeyringResult result = mDatabaseInteractor.saveSecretKeyRing(pub);
+        Assert.assertFalse("saving a public ring through the secret path should fail", result.success());
+    }
+
+    @Test
+    public void testExpectedFingerprintMismatchRejected() throws Exception {
+        UncachedKeyRing pub =
+                readRingFromResource("/test-keys/cooperpair/9E669861368BCA0BE42DAF7DDDA252EBB8EBE1AF.asc");
+        byte[] wrongFingerprint = Hex.decode("0000000000000000000000000000000000000000");
+
+        SaveKeyringResult result = mDatabaseInteractor.savePublicKeyRing(pub, wrongFingerprint);
+        Assert.assertFalse("import with a mismatching expected fingerprint should fail", result.success());
+    }
+
+    @Test
+    public void testExpectedFingerprintMatchAccepted() throws Exception {
+        UncachedKeyRing pub =
+                readRingFromResource("/test-keys/cooperpair/9E669861368BCA0BE42DAF7DDDA252EBB8EBE1AF.asc");
+        byte[] correctFingerprint = Hex.decode("9E669861368BCA0BE42DAF7DDDA252EBB8EBE1AF");
+
+        SaveKeyringResult result = mDatabaseInteractor.savePublicKeyRing(pub, correctFingerprint);
+        Assert.assertTrue("import with the correct expected fingerprint should succeed", result.success());
+    }
+
+    @Test
+    public void testLoadPublicKeyRingDataNotFound() {
+        try {
+            mDatabaseInteractor.loadPublicKeyRingData(0x1234567890abcdefL);
+            Assert.fail("loading an unknown public keyring should throw NotFoundException");
+        } catch (KeyRepository.NotFoundException expected) {
+            // good
+        }
+    }
+
+    @Test
+    public void testLoadSecretKeyRingDataReturnsNullWhenAbsent() throws Exception {
+        long unknownMasterKeyId = 0x1234567890abcdefL;
+
+        // asymmetry vs the public loader: the secret loader returns null instead of throwing
+        Assert.assertNull(mDatabaseInteractor.loadSecretKeyRingData(unknownMasterKeyId));
+
+        try {
+            mDatabaseInteractor.getCanonicalizedSecretKeyRing(unknownMasterKeyId);
+            Assert.fail("retrieving an unknown secret keyring should throw NotFoundException");
+        } catch (KeyRepository.NotFoundException expected) {
+            // good
+        }
     }
 
     UncachedKeyRing readRingFromResource(String name) throws Exception {
