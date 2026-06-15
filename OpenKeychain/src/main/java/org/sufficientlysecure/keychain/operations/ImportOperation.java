@@ -34,17 +34,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import android.content.Context;
 
 import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 import org.sufficientlysecure.keychain.R;
 import org.sufficientlysecure.keychain.daos.KeyMetadataDao;
 import org.sufficientlysecure.keychain.daos.KeyWritableRepository;
-import org.sufficientlysecure.keychain.keyimport.FacebookKeyserverClient;
 import org.sufficientlysecure.keychain.keyimport.HkpKeyserverAddress;
-import org.sufficientlysecure.keychain.keyimport.HkpKeyserverClient;
-import org.sufficientlysecure.keychain.keyimport.KeyserverClient;
 import org.sufficientlysecure.keychain.keyimport.KeyserverClient.QueryNotFoundException;
 import org.sufficientlysecure.keychain.keyimport.ParcelableKeyRing;
 import org.sufficientlysecure.keychain.network.orbot.OrbotHelper;
+import org.sufficientlysecure.keychain.operations.importOperation.ImportKeyResolver;
+import org.sufficientlysecure.keychain.operations.importOperation.ImportKeySaver;
+import org.sufficientlysecure.keychain.operations.importOperation.ImportResultBuilder;
 import org.sufficientlysecure.keychain.operations.results.ImportKeyResult;
 import org.sufficientlysecure.keychain.operations.results.OperationResult;
 import org.sufficientlysecure.keychain.operations.results.OperationResult.LogType;
@@ -58,7 +57,6 @@ import org.sufficientlysecure.keychain.pgp.exception.PgpGeneralException;
 import org.sufficientlysecure.keychain.service.ImportKeyringParcel;
 import org.sufficientlysecure.keychain.service.input.CryptoInputParcel;
 import org.sufficientlysecure.keychain.service.input.RequiredInputParcel;
-import org.sufficientlysecure.keychain.ui.util.KeyFormattingUtils;
 import org.sufficientlysecure.keychain.util.IteratorWithSize;
 import org.sufficientlysecure.keychain.util.ParcelableFileCache;
 import org.sufficientlysecure.keychain.util.ParcelableProxy;
@@ -88,8 +86,6 @@ public class ImportOperation extends BaseReadWriteOperation<ImportKeyringParcel>
     public static final String CACHE_FILE_NAME = "key_import.pcl";
 
     private final KeyMetadataDao keyMetadataDao;
-
-    private FacebookKeyserverClient facebookServer;
 
     public ImportOperation(Context context, KeyWritableRepository databaseInteractor, Progressable progressable) {
         super(context, databaseInteractor, progressable);
@@ -133,8 +129,11 @@ public class ImportOperation extends BaseReadWriteOperation<ImportKeyringParcel>
     }
 
     /**
+     * Core serial import loop. Processes each key one at a time:
+     * resolve → save → track outcome.
+     *
      * @param entries      keys to import
-     * @param numTotalKeys          number of keys to import
+     * @param numTotalKeys number of keys to import
      * @param hkpKeyserver contains uri of keyserver to import from, if it is an import from cloud
      * @param progressable Allows multi-threaded import to supply a progressable that ignores the
      *                     progress of a single key being imported
@@ -155,11 +154,11 @@ public class ImportOperation extends BaseReadWriteOperation<ImportKeyringParcel>
             return new ImportKeyResult(ImportKeyResult.RESULT_FAIL_NOTHING, log);
         }
 
-        int newKeys = 0, updatedKeys = 0, missingKeys = 0, badKeys = 0;
-        ArrayList<Long> secretMasterKeyIds = new ArrayList<>();
-        ArrayList<Long> importedMasterKeyIds = new ArrayList<>();
+        ImportResultBuilder builder = new ImportResultBuilder(true);
+        ImportKeyResolver resolver = new ImportKeyResolver();
+        ImportKeySaver saver = new ImportKeySaver(mKeyRepository, mKeyWritableRepository);
 
-        ArrayList<CanonicalizedKeyRing> canKeyRings = new ArrayList<>();
+        ArrayList<CanonicalizedKeyRing> canKeyRings = builder.getCanonicalizedKeyRings();
 
         boolean cancelled = false;
         int keyImportsFinished = 0;
@@ -174,75 +173,54 @@ public class ImportOperation extends BaseReadWriteOperation<ImportKeyringParcel>
                 break;
             }
 
-            boolean keyWasDownloaded = false;
-
             try {
-
-                UncachedKeyRing key = null;
-
-                // If there is already byte data, use that
-                if (entry.getBytes() != null) {
-                    key = UncachedKeyRing.decodeFromData(entry.getBytes());
-                } else {
-                    try {
-                        key = fetchKeyFromInternet(hkpKeyserver, proxy, log, entry, key);
-                    } catch (QueryNotFoundException e) {
-                        // note that this does NOT fire on network errors! those will be logged inline and return in null
-                        log.add(LogType.MSG_IMPORT_FETCH_ERROR_NOT_FOUND, 2);
-                        missingKeys += 1;
-
-                        byte[] fingerprintHex = entry.getExpectedFingerprint();
-                        if (fingerprintHex != null) {
-                            keyMetadataDao.renewKeyLastUpdatedTime(
-                                    KeyFormattingUtils.getKeyIdFromFingerprint(fingerprintHex), false);
-                        }
-                        continue;
-                    }
-
-                    if (key != null) {
-                        keyWasDownloaded = true;
-
-                        if (key.isSecret()) {
-                            log.add(LogType.MSG_IMPORT_FETCH_ERROR_KEYSERVER_SECRET, 2);
-                            badKeys += 1;
-                            continue;
-                        }
-                    }
-                }
-
-                if (key == null) {
-                    log.add(LogType.MSG_IMPORT_FETCH_ERROR, 2);
-                    badKeys += 1;
+                // --- Step 1: Resolve the key (decode bytes or fetch from internet) ---
+                ImportKeyResolver.ResolvedKey resolved;
+                try {
+                    resolved = resolver.resolve(entry, hkpKeyserver, proxy, log);
+                } catch (QueryNotFoundException e) {
+                    // note that this does NOT fire on network errors! those will be logged inline and return in null
+                    log.add(LogType.MSG_IMPORT_FETCH_ERROR_NOT_FOUND, 2);
+                    builder.recordMissingKey(entry.getExpectedFingerprint(), keyMetadataDao);
+                    keyImportsFinished += 1;
+                    progressable.setProgress(keyImportsFinished, numTotalKeys);
                     continue;
                 }
 
-                SaveKeyringResult result;
-                // synchronizing prevents https://github.com/open-keychain/open-keychain/issues/1221
-                // and https://github.com/open-keychain/open-keychain/issues/1480
-                synchronized (mKeyRepository) {
-                    mKeyRepository.clearLog();
-                    if (key.isSecret()) {
-                        result = mKeyWritableRepository.saveSecretKeyRing(key, canKeyRings, skipSave);
-                    } else {
-                        result = mKeyWritableRepository.savePublicKeyRing(key, entry.getExpectedFingerprint(), canKeyRings,
-                                forceReinsert, skipSave);
-                    }
+                if (resolved == null) {
+                    log.add(LogType.MSG_IMPORT_FETCH_ERROR, 2);
+                    builder.recordBadKey();
+                    keyImportsFinished += 1;
+                    progressable.setProgress(keyImportsFinished, numTotalKeys);
+                    continue;
                 }
+
+                UncachedKeyRing key = resolved.key;
+
+                // Reject secret keys downloaded from keyservers
+                if (resolved.wasDownloaded && key.isSecret()) {
+                    log.add(LogType.MSG_IMPORT_FETCH_ERROR_KEYSERVER_SECRET, 2);
+                    builder.recordBadKey();
+                    keyImportsFinished += 1;
+                    progressable.setProgress(keyImportsFinished, numTotalKeys);
+                    continue;
+                }
+
+                // --- Step 2: Save the key (synchronized) ---
+                SaveKeyringResult result = saver.save(key, entry.getExpectedFingerprint(),
+                        canKeyRings, skipSave, forceReinsert);
+
+                // --- Step 3: Track the outcome ---
                 if (!result.success()) {
-                    badKeys += 1;
+                    builder.recordBadKey();
                 } else {
                     if (result.updated()) {
-                        updatedKeys += 1;
-                        importedMasterKeyIds.add(key.getMasterKeyId());
+                        builder.recordUpdatedKey(key.getMasterKeyId());
                     } else {
-                        newKeys += 1;
-                        if (key.isSecret()) {
-                            secretMasterKeyIds.add(key.getMasterKeyId());
-                        }
-                        importedMasterKeyIds.add(key.getMasterKeyId());
+                        builder.recordNewKey(key.getMasterKeyId(), key.isSecret());
                     }
 
-                    if (!skipSave && keyWasDownloaded) {
+                    if (!skipSave && resolved.wasDownloaded) {
                         keyMetadataDao.renewKeyLastUpdatedTime(key.getMasterKeyId(), true);
                     }
                 }
@@ -250,7 +228,7 @@ public class ImportOperation extends BaseReadWriteOperation<ImportKeyringParcel>
                 log.add(result, 2);
             } catch (IOException | PgpGeneralException e) {
                 Timber.e(e, "Encountered bad key on import!");
-                ++badKeys;
+                builder.recordBadKey();
             }
 
             // update progress
@@ -262,180 +240,26 @@ public class ImportOperation extends BaseReadWriteOperation<ImportKeyringParcel>
         // synchronized on mProviderHelper to prevent
         // https://github.com/open-keychain/open-keychain/issues/1221 since a consolidate deletes
         // and re-inserts keys, which could conflict with a parallel db key update
-        if (!skipSave && !secretMasterKeyIds.isEmpty()) {
+        if (!skipSave && !builder.getSecretMasterKeyIds().isEmpty()) {
             setPreventCancel();
             synchronized (mKeyRepository) {
-                UpdateTrustResult result = mKeyWritableRepository.updateTrustDb(secretMasterKeyIds, progressable);
+                UpdateTrustResult result = mKeyWritableRepository.updateTrustDb(
+                        builder.getSecretMasterKeyIds(), progressable);
                 log.add(result, 1);
             }
         }
 
-        // convert to long array
-        long[] importedMasterKeyIdsArray = new long[importedMasterKeyIds.size()];
-        for (int i = 0; i < importedMasterKeyIds.size(); ++i) {
-            importedMasterKeyIdsArray[i] = importedMasterKeyIds.get(i);
-        }
-
-        int resultType = 0;
+        // Cancellation
+        int resultTypeExtra = 0;
         if (cancelled) {
             log.add(LogType.MSG_OPERATION_CANCELLED, 1);
-            resultType |= ImportKeyResult.RESULT_CANCELLED;
+            resultTypeExtra |= ImportKeyResult.RESULT_CANCELLED;
         }
 
-        // special return case: no new keys at all
-        if (badKeys == 0 && newKeys == 0 && updatedKeys == 0) {
-            // if keys merely aren't on keyservers, it's just a warning
-            resultType = ImportKeyResult.RESULT_FAIL_NOTHING;
-        } else {
-            if (newKeys > 0) {
-                resultType |= ImportKeyResult.RESULT_OK_NEWKEYS;
-            }
-            if (updatedKeys > 0) {
-                resultType |= ImportKeyResult.RESULT_OK_UPDATED;
-            }
-            if (badKeys > 0) {
-                resultType |= ImportKeyResult.RESULT_WITH_ERRORS;
-                if (newKeys == 0 && updatedKeys == 0) {
-                    resultType |= ImportKeyResult.RESULT_ERROR;
-                }
-            }
-            if (log.containsWarnings()) {
-                resultType |= ImportKeyResult.RESULT_WARNINGS;
-            }
-        }
+        // Final summary log
+        builder.addFinalLog(log, cancelled);
 
-        if (!cancelled) {
-            // Final log entry, it's easier to do this individually
-            if ((newKeys > 0 || updatedKeys > 0) && badKeys > 0) {
-                log.add(LogType.MSG_IMPORT_PARTIAL, 1);
-            } else if (newKeys > 0 || updatedKeys > 0) {
-                log.add(LogType.MSG_IMPORT_SUCCESS, 1);
-            } else {
-                log.add(LogType.MSG_IMPORT_ERROR, 1);
-            }
-        }
-
-        ImportKeyResult result = new ImportKeyResult(
-                resultType, log, newKeys, updatedKeys, missingKeys, badKeys, secretMasterKeyIds.size(),
-                importedMasterKeyIdsArray);
-
-        result.setCanonicalizedKeyRings(canKeyRings);
-        return result;
-    }
-
-    private UncachedKeyRing fetchKeyFromInternet(HkpKeyserverAddress hkpKeyserver, @NonNull ParcelableProxy proxy,
-            OperationLog log, ParcelableKeyRing entry, UncachedKeyRing key)
-            throws PgpGeneralException, IOException, QueryNotFoundException {
-        QueryNotFoundException queryNotFoundException = null;
-
-        boolean canFetchFromKeyservers =
-                hkpKeyserver != null && (entry.getKeyIdHex() != null || entry.getExpectedFingerprint()!= null);
-        if (canFetchFromKeyservers) {
-            UncachedKeyRing keyserverKey = null;
-            try {
-                keyserverKey = fetchKeyFromKeyserver(hkpKeyserver, proxy, log, entry);
-            } catch (QueryNotFoundException e) {
-                queryNotFoundException = e;
-            }
-
-            if (keyserverKey != null) {
-                key = keyserverKey;
-            }
-        }
-
-        boolean hasFacebookName = entry.getFbUsername() != null;
-        if (hasFacebookName) {
-            UncachedKeyRing facebookKey = fetchKeyFromFacebook(proxy, log, entry);
-            if (facebookKey != null) {
-                key = mergeKeysOrUseEither(log, 3, key, facebookKey);
-            }
-        }
-
-        if (key == null && queryNotFoundException != null) {
-            throw queryNotFoundException;
-        }
-
-        return key;
-    }
-
-    @Nullable
-    private UncachedKeyRing fetchKeyFromKeyserver(HkpKeyserverAddress hkpKeyserver, @NonNull ParcelableProxy proxy,
-            OperationLog log, ParcelableKeyRing entry) throws PgpGeneralException, IOException, KeyserverClient.QueryNotFoundException {
-        try {
-            byte[] data;
-            log.add(LogType.MSG_IMPORT_KEYSERVER, 1, hkpKeyserver);
-
-            HkpKeyserverClient keyserverInteractor = HkpKeyserverClient.fromHkpKeyserverAddress(hkpKeyserver);
-
-            // Download by fingerprint, or keyId - whichever is available
-            if (entry.getExpectedFingerprint() != null) {
-                String fingerprintHex = KeyFormattingUtils.convertFingerprintToHex(entry.getExpectedFingerprint());
-                log.add(LogType.MSG_IMPORT_FETCH_KEYSERVER, 2, "0x" +
-                        fingerprintHex.substring(24));
-                data = keyserverInteractor.get("0x" + fingerprintHex, proxy).getBytes();
-            } else {
-                log.add(LogType.MSG_IMPORT_FETCH_KEYSERVER, 2, entry.getKeyIdHex());
-                data = keyserverInteractor.get(entry.getKeyIdHex(), proxy).getBytes();
-            }
-            UncachedKeyRing keyserverKey = UncachedKeyRing.decodeFromData(data);
-            if (keyserverKey != null) {
-                log.add(LogType.MSG_IMPORT_FETCH_KEYSERVER_OK, 3);
-            } else {
-                log.add(LogType.MSG_IMPORT_FETCH_ERROR_DECODE, 3);
-            }
-
-            return keyserverKey;
-        } catch (KeyserverClient.QueryNotFoundException e) {
-            throw e;
-        } catch (KeyserverClient.QueryFailedException e) {
-            Timber.d(e, "query failed");
-            log.add(LogType.MSG_IMPORT_FETCH_ERROR_KEYSERVER, 3, e.getMessage());
-            return null;
-        }
-    }
-
-    private UncachedKeyRing fetchKeyFromFacebook(@NonNull ParcelableProxy proxy, OperationLog log, ParcelableKeyRing entry)
-            throws PgpGeneralException, IOException {
-        if (facebookServer == null) {
-            facebookServer = FacebookKeyserverClient.getInstance();
-        }
-
-        try {
-            log.add(LogType.MSG_IMPORT_FETCH_FACEBOOK, 2, entry.getFbUsername());
-            byte[] data = facebookServer.get(entry.getFbUsername(), proxy).getBytes();
-            UncachedKeyRing facebookKey = UncachedKeyRing.decodeFromData(data);
-
-            if (facebookKey != null) {
-                log.add(LogType.MSG_IMPORT_FETCH_KEYSERVER_OK, 3);
-            } else {
-                log.add(LogType.MSG_IMPORT_FETCH_ERROR_DECODE, 3);
-            }
-
-            return facebookKey;
-        } catch (KeyserverClient.QueryFailedException e) {
-            // download failed, too bad. just proceed
-            Timber.e(e, "query failed");
-            log.add(LogType.MSG_IMPORT_FETCH_ERROR_KEYSERVER, 3, e.getMessage());
-            return null;
-        }
-    }
-
-    @Nullable
-    private UncachedKeyRing mergeKeysOrUseEither(OperationLog log, int indent,
-            UncachedKeyRing firstKey, UncachedKeyRing otherKey) {
-        if (firstKey == null) {
-            return otherKey;
-        }
-
-        log.add(LogType.MSG_IMPORT_MERGE, indent);
-        UncachedKeyRing mergedKey = firstKey.merge(otherKey, log, indent +1);
-
-        if (mergedKey != null) {
-            return mergedKey;
-        } else {
-            log.add(LogType.MSG_IMPORT_MERGE_ERROR, indent +1);
-            return firstKey;
-        }
+        return builder.build(resultTypeExtra, log);
     }
 
     @NonNull
@@ -528,23 +352,17 @@ public class ImportOperation extends BaseReadWriteOperation<ImportKeyringParcel>
     }
 
     /**
-     * Used to accumulate the results of individual key imports
+     * Used to accumulate the results of individual key imports.
+     * Delegates counter tracking and bitmask computation to
+     * {@link ImportResultBuilder} to keep this logic in a single place.
      */
     public static class KeyImportAccumulator {
-        private OperationResult.OperationLog mImportLog = new OperationResult.OperationLog();
-        private Progressable mProgressable;
-        private int mTotalKeys;
+        private final OperationResult.OperationLog mImportLog = new OperationResult.OperationLog();
+        private final ImportResultBuilder builder;
+        private final Progressable mProgressable;
+        private final int mTotalKeys;
         private int mImportedKeys = 0;
-        private ArrayList<Long> mImportedMasterKeyIds = new ArrayList<>();
-        private int mBadKeys = 0;
-        private int mNewKeys = 0;
-        private int mUpdatedKeys = 0;
-        private int mMissingKeys = 0;
-        private int mSecret = 0;
-        private int mResultType = 0;
         private boolean mHasCancelledResult;
-
-        ArrayList<CanonicalizedKeyRing> mCanonicalizedKeyRings;
 
         /**
          * Accumulates keyring imports and updates the progressable whenever a new key is imported.
@@ -561,7 +379,7 @@ public class ImportOperation extends BaseReadWriteOperation<ImportKeyringParcel>
                 mProgressable.setProgress(0, totalKeys);
             }
 
-            mCanonicalizedKeyRings = new ArrayList<>();
+            builder = new ImportResultBuilder(false);
         }
 
         public void accumulateKeyImport(ImportKeyResult result) {
@@ -583,63 +401,23 @@ public class ImportOperation extends BaseReadWriteOperation<ImportKeyringParcel>
                 }
             }
 
-            mBadKeys += result.mBadKeys;
-            mNewKeys += result.mNewKeys;
-            mUpdatedKeys += result.mUpdatedKeys;
-            mMissingKeys += result.mMissingKeys;
-            mSecret += result.mSecret;
-
-            long[] masterKeyIds = result.getImportedMasterKeyIds();
-            for (long masterKeyId : masterKeyIds) {
-                mImportedMasterKeyIds.add(masterKeyId);
-            }
-
-            mCanonicalizedKeyRings.addAll(result.mCanonicalizedKeyRings);
+            builder.accumulateFrom(result);
 
             // if any key import has been cancelled, set result type to cancelled
-            // resultType is added to in getConsolidatedKayImport to account for remaining factors
-            mResultType |= result.getResult() & ImportKeyResult.RESULT_CANCELLED;
+            // resultType is added to in getConsolidatedResult to account for remaining factors
         }
 
         /**
          * returns accumulated result of all imports so far
          */
         public ImportKeyResult getConsolidatedResult() {
-
-            // adding required information to mResultType
-            // special case,no keys requested for import
-            if (mBadKeys == 0 && mNewKeys == 0 && mUpdatedKeys == 0
-                    && (mResultType & ImportKeyResult.RESULT_CANCELLED)
-                    != ImportKeyResult.RESULT_CANCELLED) {
-                mResultType = ImportKeyResult.RESULT_FAIL_NOTHING;
-            } else {
-                if (mNewKeys > 0) {
-                    mResultType |= ImportKeyResult.RESULT_OK_NEWKEYS;
-                }
-                if (mUpdatedKeys > 0) {
-                    mResultType |= ImportKeyResult.RESULT_OK_UPDATED;
-                }
-                if (mBadKeys > 0) {
-                    mResultType |= ImportKeyResult.RESULT_WITH_ERRORS;
-                    if (mNewKeys == 0 && mUpdatedKeys == 0) {
-                        mResultType |= ImportKeyResult.RESULT_ERROR;
-                    }
-                }
-                if (mImportLog.containsWarnings()) {
-                    mResultType |= ImportKeyResult.RESULT_WARNINGS;
-                }
+            int resultTypeExtra = 0;
+            // Propagate cancellation bit from accumulated results
+            if (mHasCancelledResult) {
+                resultTypeExtra |= ImportKeyResult.RESULT_CANCELLED;
             }
 
-            long masterKeyIds[] = new long[mImportedMasterKeyIds.size()];
-            for (int i = 0; i < masterKeyIds.length; i++) {
-                masterKeyIds[i] = mImportedMasterKeyIds.get(i);
-            }
-
-            ImportKeyResult result = new ImportKeyResult(mResultType, mImportLog, mNewKeys,
-                    mUpdatedKeys, mMissingKeys, mBadKeys, mSecret, masterKeyIds);
-
-            result.setCanonicalizedKeyRings(mCanonicalizedKeyRings);
-            return result;
+            return builder.build(resultTypeExtra, mImportLog);
         }
 
         boolean isImportFinished() {
