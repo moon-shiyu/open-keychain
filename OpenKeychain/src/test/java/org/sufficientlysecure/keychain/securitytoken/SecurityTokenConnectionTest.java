@@ -9,14 +9,18 @@ import org.mockito.stubbing.Answer;
 import org.robolectric.RuntimeEnvironment;
 import org.robolectric.shadows.ShadowLog;
 import org.sufficientlysecure.keychain.KeychainTestRunner;
+import org.sufficientlysecure.keychain.securitytoken.ConnectionStatus;
+import org.sufficientlysecure.keychain.securitytoken.PinState;
 import org.sufficientlysecure.keychain.securitytoken.SecurityTokenInfo.TokenType;
 import org.sufficientlysecure.keychain.securitytoken.SecurityTokenInfo.TransportType;
 import org.sufficientlysecure.keychain.util.Passphrase;
 
+import java.io.IOException;
 import java.util.LinkedList;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.mockito.Matchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -101,6 +105,93 @@ public class SecurityTokenConnectionTest {
 
         verifyDialog();
     }
+
+    @Test
+    public void test_communicate_beforeConnect_throwsIllegalState() throws Exception {
+        SecurityTokenConnection connection =
+                new SecurityTokenConnection(transport, new Passphrase("123456"), new OpenPgpCommandApduFactory());
+
+        assertEquals(ConnectionStatus.DISCONNECTED, connection.getConnectionStatus());
+
+        try {
+            connection.communicate(CommandApdu.create(0x00, 0xCA, 0x00, 0x6E));
+            fail("Expected IllegalStateException when communicating before connect");
+        } catch (IllegalStateException e) {
+            assertTrue(e.getMessage().contains("not connected"));
+        }
+    }
+
+    @Test
+    public void test_connectToDevice_setsStatusConnected() throws Exception {
+        SecurityTokenConnection connection =
+                new SecurityTokenConnection(transport, new Passphrase("123456"), new OpenPgpCommandApduFactory());
+
+        expect("00a4040006d27600012401", "9000");
+        expect("00ca006e00",
+                "6e81de4f10d27600012401020000060364311500005f520f0073000080000000000000000000007381b7c00af" +
+                        "00000ff04c000ff00ffc106010800001103c206010800001103c306010800001103c407007f7f7f03030" +
+                        "3c53c4ec5fee25c4e89654d58cad8492510a89d3c3d8468da7b24e15bfc624c6a792794f15b7599915f7" +
+                        "03aab55ed25424d60b17026b7b06c6ad4b9be30a3c63c000000000000000000000000000000000000000" +
+                        "000000000000000000000000000000000000000000000000000000000000000000000000000000000cd0" +
+                        "c59cd0f2a59cd0af059cd0c959000");
+
+        connection.connectToDevice(RuntimeEnvironment.getApplication());
+
+        assertEquals(ConnectionStatus.CONNECTED, connection.getConnectionStatus());
+        verifyDialog();
+    }
+
+    @Test
+    public void test_connectToDevice_failure_setsStatusDisconnected() throws Exception {
+        SecurityTokenConnection connection =
+                new SecurityTokenConnection(transport, new Passphrase("123456"), new OpenPgpCommandApduFactory());
+
+        // Make transport.connect() throw to simulate failure
+        org.mockito.Mockito.doThrow(new IOException("NFC tag removed"))
+                .when(transport).connect();
+
+        try {
+            connection.connectToDevice(RuntimeEnvironment.getApplication());
+            fail("Expected IOException from connect failure");
+        } catch (IOException e) {
+            assertEquals("NFC tag removed", e.getMessage());
+        }
+
+        assertEquals(ConnectionStatus.DISCONNECTED, connection.getConnectionStatus());
+        verify(transport).release();
+    }
+
+    @Test
+    public void test_disconnect_clearsPinStateAndSetsDisconnected() throws Exception {
+        SecurityTokenConnection connection =
+                new SecurityTokenConnection(transport, new Passphrase("123456"), new OpenPgpCommandApduFactory());
+
+        // First connect successfully
+        expect("00a4040006d27600012401", "9000");
+        expect("00ca006e00",
+                "6e81de4f10d27600012401020000060364311500005f520f0073000080000000000000000000007381b7c00af" +
+                        "00000ff04c000ff00ffc106010800001103c206010800001103c306010800001103c407007f7f7f03030" +
+                        "3c53c4ec5fee25c4e89654d58cad8492510a89d3c3d8468da7b24e15bfc624c6a792794f15b7599915f7" +
+                        "03aab55ed25424d60b17026b7b06c6ad4b9be30a3c63c000000000000000000000000000000000000000" +
+                        "000000000000000000000000000000000000000000000000000000000000000000000000000000000cd0" +
+                        "c59cd0f2a59cd0af059cd0c959000");
+
+        connection.connectToDevice(RuntimeEnvironment.getApplication());
+        assertEquals(ConnectionStatus.CONNECTED, connection.getConnectionStatus());
+
+        // Now disconnect
+        connection.disconnect();
+
+        assertEquals(ConnectionStatus.DISCONNECTED, connection.getConnectionStatus());
+        verify(transport).release();
+
+        // PIN state should be reset
+        PinState pinState = connection.getPinState();
+        assertTrue(!pinState.isPw1ValidatedForSignature());
+        assertTrue(!pinState.isPw1ValidatedForOther());
+        assertTrue(!pinState.isPw3Validated());
+    }
+
 
     private void expect(String commandApdu, String responseApdu) {
         expect(CommandApdu.fromBytes(Hex.decode(commandApdu)), ResponseApdu.fromBytes(Hex.decode(responseApdu)));

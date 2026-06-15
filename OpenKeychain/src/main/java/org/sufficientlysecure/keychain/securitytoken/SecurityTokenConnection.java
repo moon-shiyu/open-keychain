@@ -18,10 +18,8 @@
 package org.sufficientlysecure.keychain.securitytoken;
 
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
-import java.util.List;
 
 import android.content.Context;
 import android.os.SystemClock;
@@ -46,8 +44,6 @@ import timber.log.Timber;
  *      https://gnupg.org/ftp/specs/OpenPGP-smart-card-application-3.4.1.pdf
  */
 public class SecurityTokenConnection {
-    private static final int APDU_SW1_RESPONSE_AVAILABLE = 0x61;
-
     private static final String AID_PREFIX_FIDESMO = "A000000617";
 
     private static SecurityTokenConnection sCachedInstance;
@@ -58,6 +54,8 @@ public class SecurityTokenConnection {
     private final Passphrase cachedPin;
     private final OpenPgpCommandApduFactory commandFactory;
 
+    private ConnectionStatus connectionStatus = ConnectionStatus.DISCONNECTED;
+
     private TokenType tokenType;
     private CardCapabilities cardCapabilities;
     private OpenPgpCapabilities openPgpCapabilities;
@@ -65,13 +63,17 @@ public class SecurityTokenConnection {
 
     private SecureMessaging secureMessaging;
 
-    private boolean isPw1ValidatedForSignature; // Mode 81
-    private boolean isPw1ValidatedForOther; // Mode 82
-    private boolean isPw3Validated;
+    private final PinState pinState = new PinState();
 
 
     public static SecurityTokenConnection getInstanceForTransport(
             @NonNull Transport transport, @Nullable Passphrase pin) {
+        // Clean up stale cached connection if transport has disconnected
+        if (sCachedInstance != null && !sCachedInstance.isConnected()) {
+            sCachedInstance.disconnect();
+            sCachedInstance = null;
+        }
+
         if (sCachedInstance == null || !sCachedInstance.isPersistentConnectionAllowed() ||
                 !sCachedInstance.isConnected() || !sCachedInstance.transport.equals(transport) ||
                 (pin != null && !pin.equals(sCachedInstance.cachedPin))) {
@@ -110,6 +112,7 @@ public class SecurityTokenConnection {
      */
     @VisibleForTesting
     void connectToDevice(Context context) throws IOException {
+        connectionStatus = ConnectionStatus.CONNECTING;
         try {
             // Connect on transport layer
             transport.connect();
@@ -128,12 +131,13 @@ public class SecurityTokenConnection {
 
             refreshConnectionCapabilities();
 
-            isPw1ValidatedForSignature = false;
-            isPw1ValidatedForOther = false;
-            isPw3Validated = false;
+            pinState.reset();
 
             smEstablishIfAvailable(context);
+
+            connectionStatus = ConnectionStatus.CONNECTED;
         } catch (IOException e) {
+            connectionStatus = ConnectionStatus.DISCONNECTED;
             transport.release();
             throw e;
         }
@@ -182,78 +186,44 @@ public class SecurityTokenConnection {
     // region communication
 
     /**
-     * Transceives APDU
-     * Splits extended APDU into short APDUs and chains them if necessary
-     * Performs GET RESPONSE command(ISO/IEC 7816-4 par.7.6.1) on retrieving if necessary
+     * Transceives APDU through the full pipeline:
+     * <ol>
+     *   <li>Secure messaging encrypt (if SM is active)</li>
+     *   <li>Transport: size adaptation + command chaining + transceive + GET RESPONSE chaining</li>
+     *   <li>Secure messaging decrypt (if SM is active)</li>
+     * </ol>
+     *
+     * <p>Throws {@link IllegalStateException} if called when the connection is
+     * {@link ConnectionStatus#DISCONNECTED}.
      *
      * @param commandApdu short or extended APDU to transceive
      * @return response from the card
+     * @throws IOException on transport or secure messaging failure
      */
     public ResponseApdu communicate(CommandApdu commandApdu) throws IOException {
+        if (connectionStatus == ConnectionStatus.DISCONNECTED) {
+            throw new IllegalStateException(
+                    "SecurityTokenConnection is not connected (status: " + connectionStatus + ")");
+        }
+
+        ApduCommunicator apduCommunicator = ApduCommunicator.create(
+                transport, commandFactory, cardCapabilities);
+
         commandApdu = smEncryptIfAvailable(commandApdu);
 
         ResponseApdu lastResponse;
-
-        lastResponse = transceiveWithChaining(commandApdu);
-        lastResponse = readChainedResponseIfAvailable(lastResponse);
+        try {
+            lastResponse = apduCommunicator.communicate(commandApdu);
+        } catch (IOException e) {
+            if (!transport.isConnected()) {
+                connectionStatus = ConnectionStatus.DISCONNECTED;
+            }
+            throw e;
+        }
 
         lastResponse = smDecryptIfAvailable(lastResponse);
 
         return lastResponse;
-    }
-
-    @NonNull
-    private ResponseApdu transceiveWithChaining(CommandApdu commandApdu) throws IOException {
-        if (cardCapabilities.hasExtended()) {
-            return transport.transceive(commandApdu);
-        } else if (commandFactory.isSuitableForShortApdu(commandApdu)) {
-            CommandApdu shortApdu = commandFactory.createShortApdu(commandApdu);
-            return transport.transceive(shortApdu);
-        } else if (cardCapabilities.hasChaining()) {
-            ResponseApdu lastResponse = null;
-
-            List<CommandApdu> chainedApdus = commandFactory.createChainedApdus(commandApdu);
-            for (int i = 0, totalCommands = chainedApdus.size(); i < totalCommands; i++) {
-                CommandApdu chainedApdu = chainedApdus.get(i);
-                lastResponse = transport.transceive(chainedApdu);
-
-                boolean isLastCommand = (i == totalCommands - 1);
-                if (!isLastCommand && !lastResponse.isSuccess()) {
-                    throw new IOException("Failed to chain apdu " +
-                            "(" + i + "/" + (totalCommands-1) + ", last SW: " + lastResponse.getSw() + ")");
-                }
-            }
-
-            if (lastResponse == null) {
-                throw new IllegalStateException();
-            }
-
-            return lastResponse;
-        } else {
-            throw new IOException("Command too long, and chaining unavailable");
-        }
-    }
-
-    @NonNull
-    private ResponseApdu readChainedResponseIfAvailable(ResponseApdu lastResponse) throws IOException {
-        if (lastResponse.getSw1() != APDU_SW1_RESPONSE_AVAILABLE) {
-            return lastResponse;
-        }
-
-        ByteArrayOutputStream result = new ByteArrayOutputStream();
-        result.write(lastResponse.getData());
-
-        do {
-            // GET RESPONSE ISO/IEC 7816-4 par.7.6.1
-            CommandApdu getResponse = commandFactory.createGetResponseCommand(lastResponse.getSw2());
-            lastResponse = transport.transceive(getResponse);
-            result.write(lastResponse.getData());
-        } while (lastResponse.getSw1() == APDU_SW1_RESPONSE_AVAILABLE);
-
-        result.write(lastResponse.getSw1());
-        result.write(lastResponse.getSw2());
-
-        return ResponseApdu.fromBytes(result.toByteArray());
     }
 
     // endregion
@@ -350,7 +320,7 @@ public class SecurityTokenConnection {
     }
 
     public void verifyPinForSignature() throws IOException {
-        if (isPw1ValidatedForSignature) {
+        if (pinState.isPw1ValidatedForSignature()) {
             return;
         }
         if (cachedPin == null) {
@@ -372,11 +342,11 @@ public class SecurityTokenConnection {
             throw new CardException("Bad PIN!", response.getSw());
         }
 
-        isPw1ValidatedForSignature = true;
+        pinState.markPw1ValidatedForSignature();
     }
 
     public void verifyPinForOther() throws IOException {
-        if (isPw1ValidatedForOther) {
+        if (pinState.isPw1ValidatedForOther()) {
             return;
         }
         if (cachedPin == null) {
@@ -398,11 +368,11 @@ public class SecurityTokenConnection {
             throw new CardException("Bad PIN!", response.getSw());
         }
 
-        isPw1ValidatedForOther = true;
+        pinState.markPw1ValidatedForOther();
     }
 
     public void verifyAdminPin(Passphrase adminPin) throws IOException {
-        if (isPw3Validated) {
+        if (pinState.isPw3Validated()) {
             return;
         }
 
@@ -420,17 +390,15 @@ public class SecurityTokenConnection {
             throw new CardException("Bad PIN!", response.getSw());
         }
 
-        isPw3Validated = true;
+        pinState.markPw3Validated();
     }
 
     public void invalidateSingleUsePw1() {
-        if (!openPgpCapabilities.isPw1ValidForMultipleSignatures()) {
-            isPw1ValidatedForSignature = false;
-        }
+        pinState.invalidateSingleUsePw1(openPgpCapabilities.isPw1ValidForMultipleSignatures());
     }
 
     public void invalidatePw3() {
-        isPw3Validated = false;
+        pinState.invalidatePw3();
     }
 
     // endregion
@@ -482,6 +450,19 @@ public class SecurityTokenConnection {
         return transport.isConnected();
     }
 
+    /**
+     * Explicitly tears down this connection: clears secure messaging session,
+     * resets PIN state, marks the connection as disconnected, and releases the transport.
+     *
+     * <p>This method is idempotent — calling it on an already-disconnected connection is safe.
+     */
+    public void disconnect() {
+        clearSecureMessaging();
+        pinState.reset();
+        connectionStatus = ConnectionStatus.DISCONNECTED;
+        transport.release();
+    }
+
     public TokenType getTokenType() {
         return tokenType;
     }
@@ -492,6 +473,16 @@ public class SecurityTokenConnection {
 
     public OpenPgpCommandApduFactory getCommandFactory() {
         return commandFactory;
+    }
+
+    @VisibleForTesting
+    ConnectionStatus getConnectionStatus() {
+        return connectionStatus;
+    }
+
+    @VisibleForTesting
+    PinState getPinState() {
+        return pinState;
     }
 
 
